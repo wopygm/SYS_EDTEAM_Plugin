@@ -557,6 +557,9 @@ def enregistrer_transaction(system, station, entry, type_op):
 
 def check_for_updates():
     global status_label  # <-- Permet de modifier le texte sur l'interface d'EDMC
+    # On attend 3 secondes pour laisser l'interface d'EDMC se construire
+    import time
+    time.sleep(3)
     try:
         url_version = "https://raw.githubusercontent.com/wopygm/SYS_EDTEAM_Plugin/main/version.txt"
         req = urllib.request.Request(url_version, headers={'User-Agent': 'EDMC-Plugin-Updater'})
