@@ -556,52 +556,50 @@ def enregistrer_transaction(system, station, entry, type_op):
     except: pass
 
 def check_for_updates():
+    global status_label  # <-- Permet de modifier le texte sur l'interface d'EDMC
     try:
-        # 1. On va lire le fichier version.txt sur ton GitHub
         url_version = "https://raw.githubusercontent.com/wopygm/SYS_EDTEAM_Plugin/main/version.txt"
         req = urllib.request.Request(url_version, headers={'User-Agent': 'EDMC-Plugin-Updater'})
         with urllib.request.urlopen(req) as response:
             latest_version = response.read().decode('utf-8').strip()
 
-        # 2. On compare la version en ligne avec la version locale
         if latest_version != PLUGIN_VERSION:
             logging.info(f"SYS_EDTEAM : Mise à jour trouvée ! (v{PLUGIN_VERSION} -> v{latest_version})")
             
-            # 3. On télécharge tout le dossier sous forme de ZIP
+            # --- MESSAGE 1 : DÉBUT DE LA MAJ ---
+            try:
+                status_label.config(text=f"Téléchargement MAJ v{latest_version}...", fg="orange")
+            except: pass
+            
             url_zip = "https://github.com/wopygm/SYS_EDTEAM_Plugin/archive/refs/heads/main.zip"
             req_zip = urllib.request.Request(url_zip, headers={'User-Agent': 'EDMC-Plugin-Updater'})
             with urllib.request.urlopen(req_zip) as response_zip:
                 zip_data = response_zip.read()
             
-            # 4. On décompresse le ZIP et on écrase les fichiers locaux
             this_dir = os.path.dirname(os.path.realpath(__file__))
             with zipfile.ZipFile(io.BytesIO(zip_data)) as z:
-                # Le ZIP de GitHub met tout dans un sous-dossier "SYS_EDTEAM_Plugin-main"
-                # On doit extraire le contenu en ignorant ce dossier parent
                 for file_info in z.infolist():
-                    if file_info.is_dir():
+                    if file_info.is_dir() or file_info.filename.endswith("version.txt"):
                         continue
                     
-                    # On retire le nom du dossier principal ("SYS_EDTEAM_Plugin-main/")
                     parts = file_info.filename.split('/')
                     if len(parts) > 1:
                         relative_path = os.path.join(*parts[1:])
                         target_path = os.path.join(this_dir, relative_path)
                         
-                        # On s'assure que le dossier cible existe
                         os.makedirs(os.path.dirname(target_path), exist_ok=True)
-                        
-                        # On écrit le fichier
                         with z.open(file_info) as source, open(target_path, "wb") as target:
                             target.write(source.read())
 
             logging.info("SYS_EDTEAM : Mise à jour terminée avec succès.")
             
-            # 5. On prévient l'utilisateur dans l'interface EDMC (Optionnel mais recommandé)
-            # Si tu as un objet d'interface graphique (ex: un Label), tu peux changer son texte ici.
+            # --- MESSAGE 2 : FIN DE LA MAJ ---
+            try:
+                status_label.config(text=f"MAJ v{latest_version} OK ! Redémarrez EDMC.", fg="#00FF66")
+            except: pass
             
     except Exception as e:
-        logging.error(f"SYS_EDTEAM : Erreur lors de la mise à jour automatique : {e}")
+        logging.error(f"SYS_EDTEAM : Erreur lors de la maj : {e}")
 
 # ==========================================
 # BOOT SEQUENCE
@@ -618,7 +616,7 @@ def plugin_start3(plugin_dir):
 def plugin_app(parent):
     global status_label
     frame = tk.Frame(parent)
-    tk.Label(frame, text="SYS_EDTEAM", font=("Helvetica", 10, "bold"), fg="#00FF66").grid(row=0, column=0, sticky=tk.W, pady=(5, 0))
+    tk.Label(frame, text=f"SYS_EDTEAM v{PLUGIN_VERSION}", font=("Helvetica", 10, "bold"), fg="#00FF66").grid(row=0, column=0, sticky=tk.W)
     status_label = tk.Label(frame, text="En attente des senseurs...", fg="gray")
     status_label.grid(row=1, column=0, sticky=tk.W)
     return frame
