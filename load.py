@@ -1,4 +1,8 @@
 import os
+import urllib.request
+import zipfile
+import io
+import logging
 import time
 import math
 import json
@@ -16,7 +20,7 @@ except ImportError:
     config = None
 
 plugin_name = "SYS.EDTEAM"
-plugin_version = "1.1.1" # Mode Émission Pure (Sans poison)
+PLUGIN_VERSION = "1.0"
 
 SUPABASE_URL = "https://oailvdigfdoyfcydmabb.supabase.co"
 SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im9haWx2ZGlnZmRveWZjeWRtYWJiIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODQ2MjQzNTAsImV4cCI6MjEwMDIwMDM1MH0.rWEATcSWDyyyeKXWAkCySCZPwTsIFgDRJ7KB1u4OE00"
@@ -551,6 +555,54 @@ def enregistrer_transaction(system, station, entry, type_op):
         requests.post(f"{SUPABASE_URL}/rest/v1/journal_transactions", headers=get_headers(), json=payload)
     except: pass
 
+def check_for_updates():
+    try:
+        # 1. On va lire le fichier version.txt sur ton GitHub
+        url_version = "https://raw.githubusercontent.com/wopygm/SYS_EDTEAM_Plugin/main/version.txt"
+        req = urllib.request.Request(url_version, headers={'User-Agent': 'EDMC-Plugin-Updater'})
+        with urllib.request.urlopen(req) as response:
+            latest_version = response.read().decode('utf-8').strip()
+
+        # 2. On compare la version en ligne avec la version locale
+        if latest_version != PLUGIN_VERSION:
+            logging.info(f"SYS_EDTEAM : Mise à jour trouvée ! (v{PLUGIN_VERSION} -> v{latest_version})")
+            
+            # 3. On télécharge tout le dossier sous forme de ZIP
+            url_zip = "https://github.com/wopygm/SYS_EDTEAM_Plugin/archive/refs/heads/main.zip"
+            req_zip = urllib.request.Request(url_zip, headers={'User-Agent': 'EDMC-Plugin-Updater'})
+            with urllib.request.urlopen(req_zip) as response_zip:
+                zip_data = response_zip.read()
+            
+            # 4. On décompresse le ZIP et on écrase les fichiers locaux
+            this_dir = os.path.dirname(os.path.realpath(__file__))
+            with zipfile.ZipFile(io.BytesIO(zip_data)) as z:
+                # Le ZIP de GitHub met tout dans un sous-dossier "SYS_EDTEAM_Plugin-main"
+                # On doit extraire le contenu en ignorant ce dossier parent
+                for file_info in z.infolist():
+                    if file_info.is_dir():
+                        continue
+                    
+                    # On retire le nom du dossier principal ("SYS_EDTEAM_Plugin-main/")
+                    parts = file_info.filename.split('/')
+                    if len(parts) > 1:
+                        relative_path = os.path.join(*parts[1:])
+                        target_path = os.path.join(this_dir, relative_path)
+                        
+                        # On s'assure que le dossier cible existe
+                        os.makedirs(os.path.dirname(target_path), exist_ok=True)
+                        
+                        # On écrit le fichier
+                        with z.open(file_info) as source, open(target_path, "wb") as target:
+                            target.write(source.read())
+
+            logging.info("SYS_EDTEAM : Mise à jour terminée avec succès.")
+            
+            # 5. On prévient l'utilisateur dans l'interface EDMC (Optionnel mais recommandé)
+            # Si tu as un objet d'interface graphique (ex: un Label), tu peux changer son texte ici.
+            
+    except Exception as e:
+        logging.error(f"SYS_EDTEAM : Erreur lors de la mise à jour automatique : {e}")
+
 # ==========================================
 # BOOT SEQUENCE
 # ==========================================
@@ -558,7 +610,10 @@ def plugin_start3(plugin_dir):
     threading.Thread(target=ecoute_commandes_distantes, daemon=True).start()
     threading.Thread(target=heartbeat_loop, daemon=True).start()
     threading.Thread(target=surveiller_marche_en_fond, daemon=True).start()
-    return plugin_name
+    # On lance la vérification dans un processus séparé pour ne pas figer EDMC
+    threading.Thread(target=check_for_updates, daemon=True).start()
+    
+    return "SYS.EDTEAM"
 
 def plugin_app(parent):
     global status_label
