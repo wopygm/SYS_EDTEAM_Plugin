@@ -20,7 +20,7 @@ except ImportError:
     config = None
 
 plugin_name = "SYS.EDTEAM"
-PLUGIN_VERSION = "1.1"
+PLUGIN_VERSION = "1.2"
 
 SUPABASE_URL = "https://oailvdigfdoyfcydmabb.supabase.co"
 SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im9haWx2ZGlnZmRveWZjeWRtYWJiIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODQ2MjQzNTAsImV4cCI6MjEwMDIwMDM1MH0.rWEATcSWDyyyeKXWAkCySCZPwTsIFgDRJ7KB1u4OE00"
@@ -993,18 +993,14 @@ def journal_entry(cmdr, is_beta, system, station, entry, state):
                     sys_cible_action = action.get('system', systeme_actuel).strip().lower()
                     ordre_valide = None
 
-                    # CAS 1 : Victoire en Zone de Conflit
+                    # CAS 1 : Victoire en Zone de Conflit (Stricte sur le système)
                     if action['type'] == 'CZ_VICTOIRES':
                         ordre_valide = next((o for o in ordres_actifs if o.get('type_ordre') == 'GUERRE' and o.get('systeme_cible', '').strip().lower() == sys_cible_action), None)
-                        if not ordre_valide: ordre_valide = next((o for o in ordres_actifs if o.get('type_ordre') == 'GUERRE'), None)
 
-                    # CAS 2 : Actions standards
+                    # CAS 2 : Actions standards (Stricte sur la Faction ET le Système)
                     else:
                         if action['faction']:
                             ordre_valide = next((o for o in ordres_actifs if o.get('faction_cible', '').strip().lower() == action['faction'].strip().lower() and o.get('systeme_cible', '').strip().lower() == sys_cible_action), None)
-
-                        if not ordre_valide and action['faction']:
-                            ordre_valide = next((o for o in ordres_actifs if o.get('faction_cible', '').strip().lower() == action['faction'].strip().lower()), None)
 
                     if ordre_valide:
                         # Filtres ignorés
