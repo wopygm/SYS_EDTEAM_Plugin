@@ -20,7 +20,7 @@ except ImportError:
     config = None
 
 plugin_name = "SYS.EDTEAM"
-PLUGIN_VERSION = "1.2"
+PLUGIN_VERSION = "1.3"
 
 SUPABASE_URL = "https://oailvdigfdoyfcydmabb.supabase.co"
 SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im9haWx2ZGlnZmRveWZjeWRtYWJiIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODQ2MjQzNTAsImV4cCI6MjEwMDIwMDM1MH0.rWEATcSWDyyyeKXWAkCySCZPwTsIFgDRJ7KB1u4OE00"
@@ -635,6 +635,61 @@ def plugin_prefs(parent, cmdr, is_beta):
     cle_api_var.trace_add("write", lambda *args: sauvegarder_cle(cle_api_var.get()))
     return frame
 
+def sync_conflits_supabase(systeme, conflits):
+    """Envoie tous les conflits actifs détectés par l'éclaireur vers Supabase."""
+    try:
+        h = get_headers()
+        h["Prefer"] = "resolution=merge-duplicates"
+        
+        payloads = []
+        now_iso = datetime.now(timezone.utc).isoformat()
+        
+        for c in conflits:
+            # On ignore uniquement si le conflit est expressément marqué en attente (pending)
+            statut = str(c.get("Status", "")).lower()
+            if statut == "pending":
+                continue
+            
+            f1 = c.get("Faction1", {})
+            f2 = c.get("Faction2", {})
+            f1_nom = f1.get("Name", "")
+            f2_nom = f2.get("Name", "")
+            
+            if not f1_nom or not f2_nom:
+                continue
+                
+            cle_conflit = f"{systeme}_{min(f1_nom, f2_nom)}_{max(f1_nom, f2_nom)}".replace(" ", "_")
+            
+            payloads.append({
+                "id": cle_conflit,
+                "systeme": systeme,
+                "type_conflit": c.get("WarType", "inconnu"),
+                "faction1_nom": f1_nom,
+                "faction1_score": f1.get("WonDays", 0),
+                "faction1_enjeu": f1.get("Stake", ""),
+                "faction2_nom": f2_nom,
+                "faction2_score": f2.get("WonDays", 0),
+                "faction2_enjeu": f2.get("Stake", ""),
+                "mis_a_jour": now_iso
+            })
+            
+        if payloads:
+            res = requests.post(
+                f"{SUPABASE_URL}/rest/v1/conflits_systemes?on_conflict=id",
+                headers=h,
+                json=payloads,
+                timeout=5
+            )
+            if res.status_code in [200, 201, 204]:
+                mettre_a_jour_interface(f">_ BGS : ÉCLAIREUR ({systeme.upper()})", "#00FF66")
+            else:
+                mettre_a_jour_interface(f">_ REJET BDD CONFLIT : {res.status_code}", "red")
+        else:
+            mettre_a_jour_interface(f">_ BGS : 0 CONFLIT RETENU", "orange")
+    except Exception as e:
+        mettre_a_jour_interface(f">_ ERREUR SCRIPT CONFLIT", "red")
+        logging.error(f"[SYS_EDTEAM] Erreur synchro conflits : {e}")
+
 # ==========================================
 # ROUTEUR PRINCIPAL
 # ==========================================
@@ -657,6 +712,12 @@ def journal_entry(cmdr, is_beta, system, station, entry, state):
                     reps[f['Name']] = f['MyReputation']
             if reps:
                 threading.Thread(target=maj_generique_global, args=("QG_REPUTATIONS", "QG_DATA", json.dumps(reps), "INFO")).start()
+
+                # INTERCEPTION ÉCLAIREUR : CONFLITS BGS (GUERRES & ÉLECTIONS)
+            conflits = entry.get('Conflicts', [])
+            sys_nom = entry.get('StarSystem') or systeme_actuel
+            if conflits and sys_nom:
+                threading.Thread(target=sync_conflits_supabase, args=(sys_nom, conflits), daemon=True).start()
 
         # 🚨 LE CORRECTIF : On force l'effacement de la cible
         threading.Thread(target=maj_generique_global, args=("TARGETED_CMDR", "SYS_CORE", "LOST", "INFO")).start()
