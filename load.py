@@ -20,7 +20,7 @@ except ImportError:
     config = None
 
 plugin_name = "SYS.EDTEAM"
-PLUGIN_VERSION = "1.3"
+PLUGIN_VERSION = "1.4"
 
 SUPABASE_URL = "https://oailvdigfdoyfcydmabb.supabase.co"
 SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im9haWx2ZGlnZmRveWZjeWRtYWJiIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODQ2MjQzNTAsImV4cCI6MjEwMDIwMDM1MH0.rWEATcSWDyyyeKXWAkCySCZPwTsIFgDRJ7KB1u4OE00"
@@ -698,6 +698,37 @@ def journal_entry(cmdr, is_beta, system, station, entry, state):
     cmdr_actuel = cmdr # <-- ON ENREGISTRE TON NOM
     if system and system != systeme_actuel: systeme_actuel = system
     event = entry.get('event')
+
+    # ==========================================
+    # SUIVI TACTIQUE DES ZONES DE CONFLIT (CZ)
+    # ==========================================
+    if not hasattr(journal_entry, 'cz_cache'):
+        journal_entry.cz_cache = {'intensity': 'S', 'points': 1, 'faction': '', 'won': False}
+
+    # Réinitialisation à la sortie ou au saut
+    if event in ['SupercruiseEntry', 'FSDJump', 'CarrierJump', 'Location']:
+        journal_entry.cz_cache = {'intensity': 'S', 'points': 1, 'faction': '', 'won': False}
+
+    # Détection de l'intensité au drop
+    elif event == 'SupercruiseDestinationDrop':
+        drop_type = entry.get('Type', '')
+        if '$Warzone_PointRace_' in drop_type:
+            journal_entry.cz_cache['won'] = False
+            if 'High' in drop_type:
+                journal_entry.cz_cache['intensity'] = 'H'
+                journal_entry.cz_cache['points'] = 1.6
+            elif 'Med' in drop_type:
+                journal_entry.cz_cache['intensity'] = 'M'
+                journal_entry.cz_cache['points'] = 1.3
+            else:
+                journal_entry.cz_cache['intensity'] = 'S'
+                journal_entry.cz_cache['points'] = 1.0
+
+    # Mémorisation du camp soutenu via les primes de combat
+    elif event == 'FactionKillBond':
+        faction_alliee = entry.get('AwardingFaction')
+        if faction_alliee:
+            journal_entry.cz_cache['faction'] = faction_alliee
     
     if event in ['FSDJump', 'Location', 'CarrierJump', 'SupercruiseEntry', 'SupercruiseExit']:
         if event in ['FSDJump', 'Location', 'CarrierJump']:
@@ -900,7 +931,8 @@ def journal_entry(cmdr, is_beta, system, station, entry, state):
         'MissionCompleted', 'MissionFailed', 'MissionAbandoned', 
         'MarketSell', 'RedeemVoucher', 'SellExplorationData', 
         'MultiSellExplorationData', 'SellOrganicData', 'CommitCrime', 
-        'CollectItem', 'CollectItems', 'DataDownloaded', 'BackpackChange', 'Music'
+        'CollectItem', 'CollectItems', 'DataDownloaded', 'BackpackChange', 
+        'Music', 'ReceiveText'
     ]
 
     if entry.get('event') in bgs_events:
@@ -918,17 +950,36 @@ def journal_entry(cmdr, is_beta, system, station, entry, state):
                 if isinstance(st_state, dict): f_station = st_state.get('Name', '')
                 elif isinstance(st_state, str): f_station = st_state
 
-            # A. VICTOIRE EN ZONE DE CONFLIT (CZ SPATIALE & TERRESTRE)
+            # A. VICTOIRE EN ZONE DE CONFLIT (SPATIALE & TERRESTRE)
+            victoire_cz = False
+            
+            # 1. Combat au sol (Odyssey - piste musicale)
             if evt == 'Music':
                 track = str(entry.get('MusicTrack', '')).lower()
                 if 'conflictzone' in track and ('win' in track or 'victory' in track):
-                    actions.append({
-                        "faction": "", 
-                        "type": "CZ_VICTOIRES", 
-                        "valeur": 1, 
-                        "system": systeme_actuel, 
-                        "is_combat": True
-                    })
+                    victoire_cz = True
+
+            # 2. Combat spatial (patrouille alliée de fin de bataille)
+            elif evt == 'ReceiveText':
+                msg = entry.get('Message', '')
+                if '$Military_Passthrough' in msg:
+                    victoire_cz = True
+
+            # 3. Validation avec verrou anti-doublon
+            if victoire_cz and not journal_entry.cz_cache.get('won', False):
+                journal_entry.cz_cache['won'] = True
+                f_combat = journal_entry.cz_cache.get('faction', '')
+                pts = journal_entry.cz_cache.get('points', 1)
+                intensite = journal_entry.cz_cache.get('intensity', 'S')
+
+                actions.append({
+                    "faction": f_combat, 
+                    "type": "CZ_VICTOIRES", 
+                    "valeur": pts, 
+                    "intensite": intensite,
+                    "system": systeme_actuel, 
+                    "is_combat": True
+                })
 
             # B. VALIDATION DE MISSION
             elif evt == 'MissionCompleted': 
@@ -1054,9 +1105,12 @@ def journal_entry(cmdr, is_beta, system, station, entry, state):
                     sys_cible_action = action.get('system', systeme_actuel).strip().lower()
                     ordre_valide = None
 
-                    # CAS 1 : Victoire en Zone de Conflit (Stricte sur le système)
+                    # CAS 1 : Victoire en Zone de Conflit (Priorité à la faction défendue)
                     if action['type'] == 'CZ_VICTOIRES':
-                        ordre_valide = next((o for o in ordres_actifs if o.get('type_ordre') == 'GUERRE' and o.get('systeme_cible', '').strip().lower() == sys_cible_action), None)
+                        if action.get('faction'):
+                            ordre_valide = next((o for o in ordres_actifs if o.get('type_ordre') == 'GUERRE' and o.get('systeme_cible', '').strip().lower() == sys_cible_action and o.get('faction_cible', '').strip().lower() == action['faction'].strip().lower()), None)
+                        if not ordre_valide:
+                            ordre_valide = next((o for o in ordres_actifs if o.get('type_ordre') == 'GUERRE' and o.get('systeme_cible', '').strip().lower() == sys_cible_action), None)
 
                     # CAS 2 : Actions standards (Stricte sur la Faction ET le Système)
                     else:
@@ -1092,7 +1146,10 @@ def journal_entry(cmdr, is_beta, system, station, entry, state):
                         # DIAGNOSTIC 3 : Supabase a-t-il accepté l'insertion ?
                         if res_post.status_code in [200, 201, 204]:
                             if action['type'] == 'CZ_VICTOIRES':
-                                mettre_a_jour_interface(">_ BGS : VICTOIRE CZ ENREGISTRÉE !", "#FFD700")
+                                intensite_label = action.get('intensite', 'S')
+                                noms_cz = {'H': 'HAUTE', 'M': 'MOYENNE', 'S': 'FAIBLE'}
+                                label_cz = noms_cz.get(intensite_label, intensite_label)
+                                mettre_a_jour_interface(f">_ BGS : CZ {label_cz} +{action['valeur']} PTS", "#FFD700")
                             else:
                                 mettre_a_jour_interface(f">_ BGS : {action['type']} ENREGISTRÉ", "#00FF66")
                         else:
