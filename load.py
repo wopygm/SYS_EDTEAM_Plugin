@@ -20,7 +20,7 @@ except ImportError:
     config = None
 
 plugin_name = "SYS.EDTEAM"
-PLUGIN_VERSION = "1.5"
+PLUGIN_VERSION = "1.6"
 
 SUPABASE_URL = "https://oailvdigfdoyfcydmabb.supabase.co"
 SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im9haWx2ZGlnZmRveWZjeWRtYWJiIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODQ2MjQzNTAsImV4cCI6MjEwMDIwMDM1MH0.rWEATcSWDyyyeKXWAkCySCZPwTsIFgDRJ7KB1u4OE00"
@@ -711,13 +711,13 @@ def journal_entry(cmdr, is_beta, system, station, entry, state):
 
     # Détection de l'intensité au drop
     elif event == 'SupercruiseDestinationDrop':
-        drop_type = entry.get('Type', '')
-        if '$Warzone_PointRace_' in drop_type:
+        drop_type = str(entry.get('Type', '')).lower()
+        if 'warzone' in drop_type or 'conflict' in drop_type:
             journal_entry.cz_cache['won'] = False
-            if 'High' in drop_type:
+            if 'high' in drop_type:
                 journal_entry.cz_cache['intensity'] = 'H'
                 journal_entry.cz_cache['points'] = 1.6
-            elif 'Med' in drop_type:
+            elif 'med' in drop_type:
                 journal_entry.cz_cache['intensity'] = 'M'
                 journal_entry.cz_cache['points'] = 1.3
             else:
@@ -970,29 +970,21 @@ def journal_entry(cmdr, is_beta, system, station, entry, state):
                 if 'conflictzone' in track and ('win' in track or 'victory' in track):
                     victoire_cz = True
 
-            # 2. Combat spatial (patrouille alliée de fin de bataille ou SpecOps)
+            # 2. Combat spatial (Déclencheur d'origine restauré)
             elif evt == 'ReceiveText':
-                msg = entry.get('Message', '')
-                emetteur = str(entry.get('From', '')).lower()
-                
-                # Bonus : Si les SpecOps communiquent, c'est forcément une CZ Haute spatiale
-                if 'specops' in emetteur or 'spéciales' in emetteur:
-                    journal_entry.cz_cache['intensity'] = 'H'
-                    journal_entry.cz_cache['points'] = 1.6
-                    
-                if '$Military_Passthrough' in msg:
+                msg = str(entry.get('Message', '')).lower()
+                # On réactive ton déclencheur qui marche à tous les coups
+                if '$military_passthrough' in msg or 'warzone_pointrace_win' in msg:
                     victoire_cz = True
 
-            # 3. Combat au sol (Déclencheur de repli via l'écran des scores ou remontée dans le vaisseau)
+            # 3. Combat au sol (Déclencheur de repli)
             elif evt in ['Embark', 'BookDropship']:
-                # On valide la victoire uniquement si on a enregistré une faction alliée pendant cette instance (via les FactionKillBond)
-                if journal_entry.cz_cache.get('faction') != '':
-                    victoire_cz = True
+                victoire_cz = True
 
-            # 4. Validation avec verrou anti-doublon
-            if victoire_cz and not journal_entry.cz_cache.get('won', False):
+            # 4. Validation avec verrou anti-doublon (Exige d'avoir touché des primes)
+            f_combat = journal_entry.cz_cache.get('faction', '')
+            if victoire_cz and not journal_entry.cz_cache.get('won', False) and f_combat != '':
                 journal_entry.cz_cache['won'] = True
-                f_combat = journal_entry.cz_cache.get('faction', '')
                 pts = journal_entry.cz_cache.get('points', 1.0)
                 intensite = journal_entry.cz_cache.get('intensity', 'S')
 
