@@ -20,7 +20,7 @@ except ImportError:
     config = None
 
 plugin_name = "SYS.EDTEAM"
-PLUGIN_VERSION = "1.6"
+PLUGIN_VERSION = "1.7"
 
 SUPABASE_URL = "https://oailvdigfdoyfcydmabb.supabase.co"
 SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im9haWx2ZGlnZmRveWZjeWRtYWJiIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODQ2MjQzNTAsImV4cCI6MjEwMDIwMDM1MH0.rWEATcSWDyyyeKXWAkCySCZPwTsIFgDRJ7KB1u4OE00"
@@ -209,7 +209,7 @@ def ecoute_commandes_distantes():
                 if not commande_trouvee:
                     pass
         except: pass
-        time.sleep(4)
+        time.sleep(60)
 
 def surveiller_marche_en_fond():
     global systeme_actuel
@@ -608,9 +608,7 @@ def check_for_updates():
 # BOOT SEQUENCE
 # ==========================================
 def plugin_start3(plugin_dir):
-    threading.Thread(target=ecoute_commandes_distantes, daemon=True).start()
     threading.Thread(target=heartbeat_loop, daemon=True).start()
-    threading.Thread(target=surveiller_marche_en_fond, daemon=True).start()
     # On lance la vérification dans un processus séparé pour ne pas figer EDMC
     threading.Thread(target=check_for_updates, daemon=True).start()
     
