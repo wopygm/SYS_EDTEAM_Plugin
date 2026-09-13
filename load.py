@@ -20,7 +20,7 @@ except ImportError:
     config = None
 
 plugin_name = "SYS.EDTEAM"
-PLUGIN_VERSION = "1.7"
+PLUGIN_VERSION = "1.8"
 
 SUPABASE_URL = "https://oailvdigfdoyfcydmabb.supabase.co"
 SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im9haWx2ZGlnZmRveWZjeWRtYWJiIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODQ2MjQzNTAsImV4cCI6MjEwMDIwMDM1MH0.rWEATcSWDyyyeKXWAkCySCZPwTsIFgDRJ7KB1u4OE00"
@@ -32,6 +32,7 @@ scan_en_cours = False
 dernier_solde_fc = None
 inventaire_fc_local = None
 inventaire_lock = threading.Lock()
+cached_user_id = None
 
 def trouver_journal_dir():
     if config and hasattr(config, 'get'):
@@ -99,7 +100,7 @@ def maj_generique_global(target, system, station, type_op, val=0, vol=0):
     }
     try:
         # On ajoute user_id dans la recherche pour ne pas écraser les autres pilotes
-        res = requests.get(f"{SUPABASE_URL}/rest/v1/radar_commercial?target_commodity=eq.{target}&user_id=eq.{uid}", headers=get_headers())
+        res = requests.get(f"{SUPABASE_URL}/rest/v1/radar_commercial?select=id&target_commodity=eq.{target}&user_id=eq.{uid}", headers=get_headers())
         if res.status_code == 200 and len(res.json()) > 0:
             requests.patch(f"{SUPABASE_URL}/rest/v1/radar_commercial?id=eq.{res.json()[0]['id']}", headers=get_headers(), json=payload)
         else:
@@ -126,17 +127,21 @@ def obtenir_moyennes_galactiques():
     return {}
 
 def get_user_id():
+    global cached_user_id
+    if cached_user_id: 
+        return cached_user_id
+        
     cle = lire_cle()
     if not cle:
         mettre_a_jour_interface(">_ BLOQUÉ : AUCUNE CLÉ DANS EDMC", "red")
         return None
     try:
-        # On interroge directement TON profil sécurisé par ta clé secrète
         res = requests.get(f"{SUPABASE_URL}/rest/v1/profils?select=user_id", headers=get_headers())
         if res.status_code == 200:
             data = res.json()
             if len(data) > 0:
-                return data[0].get('user_id')
+                cached_user_id = data[0].get('user_id')
+                return cached_user_id
             else:
                 mettre_a_jour_interface(">_ BLOQUÉ : CLÉ NON RECONNUE", "red")
                 return None
@@ -182,7 +187,7 @@ def heartbeat_loop():
                         maj_generique_global("SHIP_BALANCE", "FINANCE", "BANK", "FINANCE", val=data.get('Balance'))
         except: 
             pass
-        time.sleep(10)
+        time.sleep(30)
 
 def ecoute_commandes_distantes():
     global scan_en_cours
