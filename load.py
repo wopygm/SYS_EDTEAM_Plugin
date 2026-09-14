@@ -20,10 +20,10 @@ except ImportError:
     config = None
 
 plugin_name = "SYS.EDTEAM"
-PLUGIN_VERSION = "1.8"
+PLUGIN_VERSION = "1.9"
 
 SUPABASE_URL = "https://oailvdigfdoyfcydmabb.supabase.co"
-SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im9haWx2ZGlnZmRveWZjeWRtYWJiIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODQ2MjQzNTAsImV4cCI6MjEwMDIwMDM1MH0.rWEATcSWDyyyeKXWAkCySCZPwTsIFgDRJ7KB1u4OE00"
+SUPABASE_KEY = "sb_publishable_AASqgRggHdIGttZHPGaWkA_VqrhuYNg"
 
 status_label = None
 systeme_actuel = "SYSTÈME INCONNU"
@@ -196,24 +196,20 @@ def ecoute_commandes_distantes():
             res = requests.get(f"{SUPABASE_URL}/rest/v1/commandes_terminal?statut=eq.EN_ATTENTE", headers=get_headers())
             if res.status_code == 200 and len(res.json()) > 0:
                 mon_id = get_user_id()
-                if not mon_id:
-                    time.sleep(4)
-                    continue
-                    
-                commande_trouvee = False
-                for cmd in res.json():
-                    if str(cmd.get('user_id')) == str(mon_id):
-                        commande_trouvee = True
-                        requests.patch(f"{SUPABASE_URL}/rest/v1/commandes_terminal?id=eq.{cmd['id']}", headers=get_headers(), json={"statut": "TRAITEE"})
-                        if not scan_en_cours:
-                            action = cmd.get('type_commande')
-                            if action == 'SCAN_ACHAT': threading.Thread(target=processus_scan_achats).start()
-                            elif action == 'SCAN_VENTE': threading.Thread(target=processus_scan_ventes).start()
-                            elif action == 'SCAN_PREDICTIF': threading.Thread(target=processus_scan_predictif).start()
-                            
-                if not commande_trouvee:
-                    pass
+                if mon_id:
+                    commande_trouvee = False
+                    for cmd in res.json():
+                        if str(cmd.get('user_id')) == str(mon_id):
+                            commande_trouvee = True
+                            requests.patch(f"{SUPABASE_URL}/rest/v1/commandes_terminal?id=eq.{cmd['id']}", headers=get_headers(), json={"statut": "TRAITEE"})
+                            if not scan_en_cours:
+                                action = cmd.get('type_commande')
+                                if action == 'SCAN_ACHAT': threading.Thread(target=processus_scan_achats).start()
+                                elif action == 'SCAN_VENTE': threading.Thread(target=processus_scan_ventes).start()
+                                elif action == 'SCAN_PREDICTIF': threading.Thread(target=processus_scan_predictif).start()
         except: pass
+        
+        # VERROU ABSOLU : Le script patiente 1 minute, quoi qu'il arrive.
         time.sleep(60)
 
 def surveiller_marche_en_fond():
