@@ -20,7 +20,7 @@ except ImportError:
     config = None
 
 plugin_name = "SYS.EDTEAM"
-PLUGIN_VERSION = "1.9"
+PLUGIN_VERSION = "2.0"
 
 SUPABASE_URL = "https://oailvdigfdoyfcydmabb.supabase.co"
 SUPABASE_KEY = "sb_publishable_AASqgRggHdIGttZHPGaWkA_VqrhuYNg"
@@ -30,9 +30,10 @@ systeme_actuel = "SYSTÈME INCONNU"
 cmdr_actuel = None # <-- NOUVELLE VARIABLE
 scan_en_cours = False
 dernier_solde_fc = None
-inventaire_fc_local = None
-inventaire_lock = threading.Lock()
 cached_user_id = None
+invalid_api_key = False
+dernier_solde_vaisseau = None
+dernier_etat_cible = "LOST"
 
 def trouver_journal_dir():
     if config and hasattr(config, 'get'):
@@ -62,6 +63,7 @@ def get_headers():
         "apikey": SUPABASE_KEY,
         "Authorization": f"Bearer {SUPABASE_KEY}",
         "Content-Type": "application/json",
+        "Prefer": "return=minimal",
         "x-commandant-key": cle if cle else "NO_KEY",
         "User-Agent": f"SYS.EDTEAM/{cle}" if cle else "SYS.EDTEAM/NO_KEY"
     }
@@ -70,8 +72,10 @@ def get_headers():
 # LE PONT DE COMMUNICATION
 # ==========================================
 def patch_parametres(payload):
+    uid = get_user_id()
+    if not uid: return
     try:
-        res = requests.get(f"{SUPABASE_URL}/rest/v1/radar_commercial?target_commodity=eq.PARAM_UPDATE", headers=get_headers())
+        res = requests.get(f"{SUPABASE_URL}/rest/v1/radar_commercial?select=id,station_name&target_commodity=eq.PARAM_UPDATE&user_id=eq.{uid}", headers=get_headers())
         if res.status_code == 200 and len(res.json()) > 0:
             row = res.json()[0]
             try: existing = json.loads(row.get('station_name', '{}'))
@@ -79,7 +83,7 @@ def patch_parametres(payload):
             existing.update(payload)
             requests.patch(f"{SUPABASE_URL}/rest/v1/radar_commercial?id=eq.{row['id']}", headers=get_headers(), json={"station_name": json.dumps(existing)})
         else:
-            data = {"system_name": "SYS_CORE", "station_name": json.dumps(payload), "target_commodity": "PARAM_UPDATE", "type_operation": "STATUS", "prix_unitaire": 0, "volume_disponible": 0, "distance": 0, "prix_moyen": 0}
+            data = {"user_id": uid, "system_name": "SYS_CORE", "station_name": json.dumps(payload), "target_commodity": "PARAM_UPDATE", "type_operation": "STATUS", "prix_unitaire": 0, "volume_disponible": 0, "distance": 0, "prix_moyen": 0}
             requests.post(f"{SUPABASE_URL}/rest/v1/radar_commercial", headers=get_headers(), json=data)
     except: pass
 
@@ -127,9 +131,11 @@ def obtenir_moyennes_galactiques():
     return {}
 
 def get_user_id():
-    global cached_user_id
+    global cached_user_id, invalid_api_key
     if cached_user_id: 
         return cached_user_id
+    if invalid_api_key:
+        return None # <-- LE BOUCLIER : On stoppe l'hémorragie ici
         
     cle = lire_cle()
     if not cle:
@@ -144,9 +150,12 @@ def get_user_id():
                 return cached_user_id
             else:
                 mettre_a_jour_interface(">_ BLOQUÉ : CLÉ NON RECONNUE", "red")
+                invalid_api_key = True # <-- VERROUILLAGE
                 return None
         else:
             mettre_a_jour_interface(f">_ ERREUR BDD : {res.status_code}", "red")
+            if res.status_code in [401, 403]:
+                invalid_api_key = True # <-- VERROUILLAGE
             return None
     except:
         mettre_a_jour_interface(">_ BLOQUÉ : ERREUR RÉSEAU", "red")
@@ -170,10 +179,9 @@ def mettre_a_jour_interface(texte, couleur):
     if status_label:
         try: status_label.after(0, lambda t=texte, c=couleur: status_label.config(text=t, fg=c))
         except: pass
-    sys_a_sauver = recuperer_dernier_systeme_connu()
-    threading.Thread(target=maj_generique_global, args=("SYSTEM_STATUS", sys_a_sauver, texte, "INFO")).start()
 
 def heartbeat_loop():
+    global dernier_solde_vaisseau
     while True:
         try:
             timestamp = str(int(time.time()))
@@ -183,378 +191,13 @@ def heartbeat_loop():
             if jdir and os.path.exists(os.path.join(jdir, 'Status.json')):
                 with open(os.path.join(jdir, 'Status.json'), 'r', encoding='utf-8') as f:
                     data = json.load(f)
-                    if data.get('Balance') is not None: 
-                        maj_generique_global("SHIP_BALANCE", "FINANCE", "BANK", "FINANCE", val=data.get('Balance'))
+                    nouveau_solde = data.get('Balance')
+                    if nouveau_solde is not None and nouveau_solde != dernier_solde_vaisseau: 
+                        maj_generique_global("SHIP_BALANCE", "FINANCE", "BANK", "FINANCE", val=nouveau_solde)
+                        dernier_solde_vaisseau = nouveau_solde
         except: 
             pass
-        time.sleep(30)
-
-def ecoute_commandes_distantes():
-    global scan_en_cours
-    while True:
-        try:
-            res = requests.get(f"{SUPABASE_URL}/rest/v1/commandes_terminal?statut=eq.EN_ATTENTE", headers=get_headers())
-            if res.status_code == 200 and len(res.json()) > 0:
-                mon_id = get_user_id()
-                if mon_id:
-                    commande_trouvee = False
-                    for cmd in res.json():
-                        if str(cmd.get('user_id')) == str(mon_id):
-                            commande_trouvee = True
-                            requests.patch(f"{SUPABASE_URL}/rest/v1/commandes_terminal?id=eq.{cmd['id']}", headers=get_headers(), json={"statut": "TRAITEE"})
-                            if not scan_en_cours:
-                                action = cmd.get('type_commande')
-                                if action == 'SCAN_ACHAT': threading.Thread(target=processus_scan_achats).start()
-                                elif action == 'SCAN_VENTE': threading.Thread(target=processus_scan_ventes).start()
-                                elif action == 'SCAN_PREDICTIF': threading.Thread(target=processus_scan_predictif).start()
-        except: pass
-        
-        # VERROU ABSOLU : Le script patiente 1 minute, quoi qu'il arrive.
-        time.sleep(60)
-
-def surveiller_marche_en_fond():
-    global systeme_actuel
-    jdir = trouver_journal_dir()
-    if not jdir: return
-    dernier_mtime = 0
-    market_path = os.path.join(jdir, 'Market.json')
-    status_path = os.path.join(jdir, 'Status.json')
-    
-    while True:
-        try:
-            if os.path.exists(status_path):
-                with open(status_path, 'r', encoding='utf-8') as f:
-                    s_data = json.load(f)
-                    if 'SystemName' in s_data: systeme_actuel = s_data['SystemName']
-
-            if os.path.exists(market_path):
-                mtime = os.path.getmtime(market_path)
-                if mtime != dernier_mtime:
-                    dernier_mtime = mtime
-                    analyser_marche_detecte(market_path, systeme_actuel)
-        except: pass
-        time.sleep(1)
-
-def analyser_marche_detecte(market_file, sys_actuel):
-    try:
-        mettre_a_jour_interface(">_ ANALYSE LOCALE EN COURS...", "#FFD700")
-        time.sleep(0.3)
-        with open(market_file, 'r', encoding='utf-8') as f: market_data = json.load(f)
-        items = market_data.get('Items') or []
-        sta_exacte = market_data.get('StationName', "STATION INCONNUE")
-        sys_exact = market_data.get('StarSystem', sys_actuel)
-        
-        user_id = get_user_id()
-        parametres = obtenir_parametres()
-        moyennes_modifiees = False
-        payload_local = []
-
-        moyennes_a_sauver = []
-
-        # On scanne TOUT le marché sans limite
-        for item in items:
-            nom_brut = item.get('Name', '') or ''
-            if not nom_brut: continue
-            
-            nom_marchandise = formater_nom_marchandise(nom_brut)
-            if not nom_marchandise: continue # <-- LE BOUCLIER : Rejette tout ce qui n'est pas dans le catalogue
-            
-            stock_reel = item.get('Stock', 0)
-            prix_moyen_jeu = item.get('MeanPrice', 0)
-
-            # L'aspirateur global pour la table commune
-            if prix_moyen_jeu > 0:
-                moyennes_a_sauver.append({"marchandise": nom_marchandise, "prix_moyen": prix_moyen_jeu})
-
-            # On prépare l'affichage local classique
-            if stock_reel > 0:
-                payload_local.append({
-                    "user_id": user_id,
-                    "system_name": sys_exact, 
-                    "station_name": sta_exacte, 
-                    "target_commodity": nom_marchandise, 
-                    "type_operation": "PREDICTIF_LOCAL", 
-                    "prix_unitaire": item.get('BuyPrice', 0), 
-                    "volume_disponible": stock_reel, 
-                    "date_maj": datetime.now(timezone.utc).isoformat(),
-                    "distance": 0, 
-                    "prix_moyen": prix_moyen_jeu
-                })
-
-        # TRANSMISSION DE L'ENCYCLOPÉDIE (UPSERT)
-        if moyennes_a_sauver:
-            try:
-                h = get_headers()
-                h["Prefer"] = "resolution=merge-duplicates"
-                res_db = requests.post(f"{SUPABASE_URL}/rest/v1/moyennes_galactiques?on_conflict=marchandise", headers=h, json=moyennes_a_sauver)
-                
-                # Si Supabase refuse, on affiche le code d'erreur sur l'interface EDMC
-                if res_db.status_code not in [200, 201, 204]:
-                    mettre_a_jour_interface(f">_ REJET BDD : ERREUR {res_db.status_code}", "red")
-            except: pass
-
-        # VÉRIFICATION : Est-ce que cette station est une cible de nos radars ?
-        station_est_cible = False
-        if user_id and payload_local:
-            try:
-                res_check = requests.get(
-                    f"{SUPABASE_URL}/rest/v1/radar_commercial",
-                    headers=get_headers(),
-                    params={
-                        "user_id": f"eq.{user_id}",
-                        "system_name": f"eq.{sys_exact}",
-                        "type_operation": "in.(ACHAT,VENTE,PREDICTIF)"
-                    }
-                )
-                if res_check.status_code == 200:
-                    for cible in res_check.json():
-                        # On vérifie si le nom brut du jeu est contenu dans le nom formaté avec le [PAD]
-                        if sta_exacte.lower() in cible.get('station_name', '').lower():
-                            station_est_cible = True
-                            break
-            except: pass
-
-        # ENREGISTREMENT CONDITIONNEL
-        if payload_local and user_id and station_est_cible:
-            sta_safe = sta_exacte.replace(' ', '%20')
-            requests.delete(f"{SUPABASE_URL}/rest/v1/radar_commercial?type_operation=eq.PREDICTIF_LOCAL&station_name=eq.{sta_safe}&user_id=eq.{user_id}", headers=get_headers())
-            requests.post(f"{SUPABASE_URL}/rest/v1/radar_commercial", headers=get_headers(), json=payload_local)
-            mettre_a_jour_interface(f">_ RAPPORT TRANSMIS : {sta_exacte}", "#00FF66")
-        else:
-            # La station n'est pas ciblée : on a juste aspiré les moyennes silencieusement
-            mettre_a_jour_interface(">_ MOYENNES ASPIRÉES (HORS CIBLE)", "gray")
-            
-    except:
-        mettre_a_jour_interface(">_ ERREUR ANALYSE", "red")
-
-def formater_nom_marchandise(nom_brut):
-    # Le catalogue strict des marchandises de masse (Filtre anti-déchets)
-    marchandises_utiles = [
-        "Advanced Catalysers", "Advanced Medicines", "Agronomic Treatment", "Algae", "Aluminium", 
-        "Animal Meat", "Animal Monitors", "Aquaponic Systems", "Atmospheric Extractors", "Auto-Fabricators", 
-        "Basic Medicines", "Bauxite", "Beer", "Bertrandite", "Beryllium", "Bioreducing Lichen", "Biowaste", 
-        "Bismuth", "Bootleg Liquor", "Bromellite", "Building Fabricators", "Ceramic Composites", 
-        "Chemical Waste", "Clothing", "Cobalt", "Coffee", "Coltan", "Combat Stabilisers", 
-        "Computer Components", "Conductive Fabrics", "Consumer Technology", "Cooling Hoses", "Copper", 
-        "Crop Harvesters", "Cryolite", "Diagnostics Sensor", "Domestic Appliances", "Earth Relics", 
-        "Emergency Power Cells", "Evacuation Shelter", "Exhaust Manifold", "Explosives", "Fish", 
-        "Food Cartridges", "Fruit and Vegetables", "Gallite", "Gallium", "Geological Equipment", 
-        "Gold", "Goshenite", "Grain", "Hazardous Environment Suits", "Helium", "Hydrogen Fuel", 
-        "Hydrogen Peroxide", "Imperial Slaves", "Indite", "Indium", "Insulating Membrane", 
-        "Ion Distributors", "Jadeite", "Land Enrichment Systems", "Leather", "Lepidolite", 
-        "Liquid Oxygen", "Liquor", "Lithium", "Low Temperature Diamonds", "Magnetic Emitter Coil", 
-        "Marine Equipment", "Medical Diagnostic Equipment", "Micro Controllers", "Micro-Weavers", 
-        "Microbial Furnaces", "Mineral Extractors", "Mineral Oil", "Moissanite", "Monazite", 
-        "Musgravite", "Narcotics", "Nerve Agents", "Non-Lethal Weapons", "Osmium", "Painite", 
-        "Palladium", "Performance Enhancers", "Personal Effects", "Personal Weapons", "Pesticides", 
-        "Platinum", "Polymers", "Power Generators", "Power Transfer Conduits", "Progenitor Cells", 
-        "Radiation Baffle", "Reactive Armour", "Reinforced Baffling", "Resonating Separators", 
-        "Robotics", "Rutile", "Scrap", "Semiconductors", "Silver", "Slaves", "Structural Regulators", 
-        "Superconductors", "Survival Equipment", "Synthetic Fabrics", "Synthetic Meat", "Synthetic Reagents", 
-        "Taaffeite", "Tantalum", "Tea", "Titanium", "Tobacco", "Tritium", "Uraninite", "Void Opals", 
-        "Water", "Water Purifiers", "Wine"
-    ]
-    
-    nom_propre = nom_brut.lower().replace("$", "").replace("_name;", "")
-    
-    for m in marchandises_utiles:
-        if m.lower().replace(" ", "").replace("-", "") == nom_propre:
-            return m
-            
-    # Si c'est une marchandise rare, inconnue ou de l'Odyssey, on retourne None pour la rejeter
-    return None
-
-def formater_donnees(sta, marchandise, mode, prix, volume, prix_moyen, user_id=None):
-    pad = 'L' if sta.get('has_large_pad') else '?'
-    etat = sta.get('controlling_minor_faction_state', 'None').lower()
-    etats = {"infrastructure failure": "INFRA. DÉFAILLANTE", "boom": "BOOM ÉCO.", "bust": "CRISE", "outbreak": "ÉPIDÉMIE", "investment": "INVESTISSEMENT", "blight": "FLÉAU"}
-    tag = f" [{etats.get(etat, etat.upper())}]" if etat in etats else ""
-    
-    return {
-        "user_id": user_id,
-        "system_name": sta.get('system_name'), 
-        "station_name": f"{sta.get('name')} [PAD {pad}]{tag}", 
-        "type_operation": mode, 
-        "target_commodity": marchandise, 
-        "prix_unitaire": prix, 
-        "volume_disponible": volume, 
-        "date_maj": sta.get('market_updated_at', 'Inconnue'), 
-        "distance": sta.get('distance', 0), 
-        "prix_moyen": prix_moyen
-    }
-
-def finaliser_scan(cibles_finales):
-    global scan_en_cours
-    if not cibles_finales: mettre_a_jour_interface("Scan terminé : 0 station trouvée.", "orange")
-    else:
-        mettre_a_jour_interface("Récupération EDSM & Transmission BDD...", "orange")
-        for data in cibles_finales:
-            try: requests.post(f"{SUPABASE_URL}/rest/v1/radar_commercial", headers=get_headers(), json=data)
-            except: pass
-        mettre_a_jour_interface("Liaison BDD terminée.", "#00FF00")
-    time.sleep(3)
-    mettre_a_jour_interface(f">_ POSITION ACTUELLE : {recuperer_dernier_systeme_connu().upper()}", "#00F0FF")
-    scan_en_cours = False
-
-def processus_scan_achats():
-    global scan_en_cours, systeme_actuel
-    moyennes_gal = obtenir_moyennes_galactiques()
-    scan_en_cours = True
-    mettre_a_jour_interface("Amorçage des senseurs...", "orange")
-
-    try:
-        user_id = get_user_id()
-        if user_id:
-            requests.delete(f"{SUPABASE_URL}/rest/v1/radar_commercial?type_operation=eq.ACHAT&user_id=eq.{user_id}", headers=get_headers())
-        parametres = obtenir_parametres()
-        cibles_vip = [c for c in parametres.get('cibles_achat', []) if c.strip() and "AUCUNE" not in c.upper()]
-        if not cibles_vip:
-            mettre_a_jour_interface("Scan annulé : Aucune cible.", "red"); time.sleep(3); mettre_a_jour_interface(f">_ POSITION ACTUELLE : {systeme_actuel.upper()}", "#00F0FF"); scan_en_cours = False; return
-        cibles_finales = []
-        for i, marchandise in enumerate(cibles_vip):
-            achats_temporaires = []
-            for (min_dist, max_dist) in [(0, 200), (200, 400), (400, 600), (600, 800), (800, 1000), (1000, 1200)]:
-                mettre_a_jour_interface(f"Scan ACHAT [{i+1}/{len(cibles_vip)}] {marchandise} : {min_dist}-{max_dist} AL", "orange")
-                for page in range(0, 10):
-                    try:
-                        res = requests.post("https://spansh.co.uk/api/stations/search", json={"filters": {"commodities": {"value": [marchandise]}, "distance": {"min": min_dist, "max": max_dist}, "has_market": {"value": True}, "is_fleet_carrier": {"value": False}, "has_large_pad": {"value": True}}, "reference_system": recuperer_dernier_systeme_connu(), "size": 250, "page": page}, timeout=10)
-                        if res.status_code != 200 or not res.json().get('results'): break 
-                        for sta in res.json().get('results', []):
-                            if "carrier" in sta.get('type', '').lower() or not sta.get('market_updated_at'): continue
-                            try:
-                                if (datetime.now(timezone.utc) - datetime.fromisoformat(sta['market_updated_at'].replace('Z', '+00:00'))).total_seconds() / 3600.0 > 48: continue
-                            except: continue
-                            for item in (sta.get('market') or []):
-                                if item.get('commodity') == marchandise and item.get('supply', 0) >= 5000:
-                                    prix_moyen_spansh = item.get('mean_price', 0)
-                                    prix_moyen_final = prix_moyen_spansh if prix_moyen_spansh > 0 else moyennes_gal.get(marchandise, 0)
-                                    achats_temporaires.append(formater_donnees(sta, marchandise, "ACHAT", item.get('buy_price', 0), item.get('supply', 0), prix_moyen_final, user_id))
-                                    break
-                    except: break 
-            cibles_finales.extend(sorted(achats_temporaires, key=lambda x: x['prix_unitaire'])[:15])
-        finaliser_scan(cibles_finales)
-    except:
-        mettre_a_jour_interface("Erreur Scan Achat", "red")
-        scan_en_cours = False
-
-def processus_scan_ventes():
-    global scan_en_cours, systeme_actuel
-    scan_en_cours = True
-    mettre_a_jour_interface("Amorçage des senseurs...", "orange")
-    try:
-        user_id = get_user_id()
-        if user_id:
-            requests.delete(f"{SUPABASE_URL}/rest/v1/radar_commercial?type_operation=eq.VENTE&user_id=eq.{user_id}", headers=get_headers())
-        parametres = obtenir_parametres()
-        res_fc = requests.get(f"{SUPABASE_URL}/rest/v1/inventaire_fc?quantite=gt.0", headers=get_headers())
-        res_ship = requests.get(f"{SUPABASE_URL}/rest/v1/radar_commercial?type_operation=eq.SHIP_CARGO", headers=get_headers())
-        
-        stocks_consolides = {}
-        for item in (res_fc.json() if res_fc.status_code == 200 else []):
-            if item.get('marchandise'): stocks_consolides[item['marchandise']] = stocks_consolides.get(item['marchandise'], 0) + item.get('quantite', 0)
-        for item in (res_ship.json() if res_ship.status_code == 200 else []):
-            if item.get('target_commodity'): stocks_consolides[item['target_commodity']] = stocks_consolides.get(item['target_commodity'], 0) + item.get('volume_disponible', 0)
-            
-        marchandises_en_soute = [m[0] for m in sorted(stocks_consolides.items(), key=lambda x: x[1], reverse=True)][:4]
-
-        if not marchandises_en_soute:
-            mettre_a_jour_interface("Soute vide. Scan annulé.", "red"); time.sleep(3); mettre_a_jour_interface(f">_ POSITION ACTUELLE : {systeme_actuel.upper()}", "#00F0FF"); scan_en_cours = False; return
-            
-        cibles_finales = []
-        for i, marchandise in enumerate(marchandises_en_soute):
-            ventes_temporaires = []
-            for (min_dist, max_dist) in [(0, 200), (200, 400), (400, 600), (600, 800), (800, 1000), (1000, 1200)]:
-                mettre_a_jour_interface(f"Scan VENTE [{i+1}/{len(marchandises_en_soute)}] {marchandise} : {min_dist}-{max_dist} AL", "orange")
-                for page in range(0, 10):
-                    try:
-                        res = requests.post("https://spansh.co.uk/api/stations/search", json={"filters": {"commodities": {"value": [marchandise]}, "distance": {"min": min_dist, "max": max_dist}, "has_market": {"value": True}, "is_fleet_carrier": {"value": False}, "has_large_pad": {"value": True}}, "reference_system": recuperer_dernier_systeme_connu(), "size": 250, "page": page}, timeout=10)
-                        if res.status_code != 200 or not res.json().get('results'): break 
-                        for sta in res.json().get('results', []):
-                            if "carrier" in sta.get('type', '').lower() or not sta.get('market_updated_at'): continue
-                            try:
-                                if (datetime.now(timezone.utc) - datetime.fromisoformat(sta['market_updated_at'].replace('Z', '+00:00'))).total_seconds() / 3600.0 > 48: continue
-                            except: continue
-                            for item in (sta.get('market') or []):
-                                if item.get('commodity') == marchandise and item.get('demand', 0) >= 5000:
-                                    prix_moyen_spansh = item.get('mean_price', 0)
-                                    prix_moyen_final = prix_moyen_spansh if prix_moyen_spansh > 0 else moyennes_gal.get(marchandise, 0)
-                                    ventes_temporaires.append(formater_donnees(sta, marchandise, "VENTE", item.get('sell_price', 0), item.get('demand', 0), prix_moyen_final, user_id))
-                                    break
-                    except: break 
-            cibles_finales.extend(sorted(ventes_temporaires, key=lambda x: x['prix_unitaire'], reverse=True)[:5])
-        finaliser_scan(cibles_finales)
-    except:
-        mettre_a_jour_interface("Erreur Scan Vente", "red")
-        scan_en_cours = False
-
-def processus_scan_predictif():
-    global scan_en_cours, systeme_actuel
-    scan_en_cours = True
-    mettre_a_jour_interface("Amorçage Radar Prédictif (BGS)...", "orange")
-    try:
-        user_id = get_user_id()
-        if user_id:
-            # 1. On efface tes anciennes cibles prédictives
-            requests.delete(f"{SUPABASE_URL}/rest/v1/radar_commercial?type_operation=eq.PREDICTIF&user_id=eq.{user_id}", headers=get_headers())
-            
-            # 2. PURGE INTELLIGENTE : On efface tes marchés locaux vieux de plus de 3 jours
-            limite_memoire = (datetime.now(timezone.utc) - timedelta(days=3)).isoformat()
-            requests.delete(f"{SUPABASE_URL}/rest/v1/radar_commercial?type_operation=eq.PREDICTIF_LOCAL&user_id=eq.{user_id}&date_maj=lt.{limite_memoire}", headers=get_headers())
-        cibles_finales = []
-        for (min_dist, max_dist) in [(0, 500), (500, 1000), (1000, 1500), (1500, 2000)]:
-            mettre_a_jour_interface(f"Scan PRÉDICTIF : {min_dist}-{max_dist} AL", "orange")
-            for page in range(0, 10):
-                try:
-                    res = requests.post("https://spansh.co.uk/api/stations/search", json={"filters": {"primary_economy": {"value": ["Extraction", "Refinery", "Agriculture", "High Tech"]}, "distance": {"min": min_dist, "max": max_dist}, "has_large_pad": {"value": True}, "is_fleet_carrier": {"value": False}}, "reference_system": recuperer_dernier_systeme_connu(), "size": 250, "page": page}, timeout=10)
-                    if res.status_code != 200 or not res.json().get('results'): break 
-                    for sta in res.json().get('results', []):
-                        if "carrier" in sta.get('type', '').lower(): continue
-                        etat_faction = sta.get('controlling_minor_faction_state', '').lower()
-                        if etat_faction not in ['infrastructure failure', 'bust', 'blight', 'outbreak', 'boom', 'investment']: continue
-                        date_maj = sta.get('updated_at') or sta.get('market_updated_at')
-                        if not date_maj: continue
-                        try:
-                            if (datetime.now(timezone.utc) - datetime.fromisoformat(date_maj.replace('Z', '+00:00'))).total_seconds() / 3600.0 > 48: continue
-                        except: continue
-                        cibles_finales.append(formater_donnees(sta, "MÉTAUX/MINÉRAUX", "PREDICTIF", 0, 0, 0, user_id))
-                except: break 
-        finaliser_scan(sorted(cibles_finales, key=lambda x: x['distance'])[:15])
-    except:
-        mettre_a_jour_interface("Erreur Scan Prédictif", "red")
-        scan_en_cours = False
-
-def recalcul_distances_mathematiques(pos_vaisseau):
-    try:
-        vx, vy, vz = pos_vaisseau[0], pos_vaisseau[1], pos_vaisseau[2]
-        res = requests.get(f"{SUPABASE_URL}/rest/v1/radar_commercial?select=id,x,y,z&type_operation=in.(ACHAT,VENTE)", headers=get_headers())
-        if res.status_code == 200:
-            for cible in res.json():
-                cx, cy, cz = cible.get('x', 0), cible.get('y', 0), cible.get('z', 0)
-                if cx == 0 and cy == 0 and cz == 0: continue 
-                requests.patch(f"{SUPABASE_URL}/rest/v1/radar_commercial?id=eq.{cible['id']}", headers=get_headers(), json={"distance": math.sqrt((cx - vx)**2 + (cy - vy)**2 + (cz - vz)**2)})
-            mettre_a_jour_interface(f"Distances recalibrées", "#00FF00")
-            time.sleep(2)
-            mettre_a_jour_interface(f">_ POSITION ACTUELLE : {systeme_actuel.upper()}", "gray")
-    except: pass
-
-def enregistrer_transaction(system, station, entry, type_op):
-    try:
-        user_id = get_user_id()
-        if not user_id: return
-        
-        payload = {
-            "user_id": user_id,
-            "type_operation": type_op,
-            "systeme": system if system else "INCONNU",
-            "station": station if station else "INCONNUE",
-            "marchandise": formater_nom_marchandise(entry.get('Type', '')),
-            "quantite": int(entry.get('Count', 0)),
-            "prix_unitaire": int(entry.get('BuyPrice', 0)) if type_op == 'ACHAT' else int(entry.get('SellPrice', 0)),
-            "total": int(entry.get('TotalCost', 0)) if type_op == 'ACHAT' else int(entry.get('TotalSale', 0))
-        }
-        
-        requests.post(f"{SUPABASE_URL}/rest/v1/journal_transactions", headers=get_headers(), json=payload)
-    except: pass
+        time.sleep(60) # <-- On passe de 30s à 60s
 
 def check_for_updates():
     global status_label  # <-- Permet de modifier le texte sur l'interface d'EDMC
@@ -743,6 +386,8 @@ def journal_entry(cmdr, is_beta, system, station, entry, state):
     if event in ['FSDJump', 'Location', 'CarrierJump', 'SupercruiseEntry', 'SupercruiseExit']:
         if event in ['FSDJump', 'Location', 'CarrierJump']:
             mettre_a_jour_interface(f">_ POSITION ACTUELLE : {systeme_actuel.upper()}", "#00F0FF")
+            # ÉMISSION CHIRURGICALE POUR COVAS (Uniquement au changement de système)
+            threading.Thread(target=maj_generique_global, args=("SYSTEM_STATUS", systeme_actuel, "JUMP", "INFO")).start()
             
         # NOUVEAU : Capture des réputations des factions locales
         if event in ['FSDJump', 'Location']:
@@ -786,9 +431,10 @@ def journal_entry(cmdr, is_beta, system, station, entry, state):
             mettre_a_jour_interface(f">_ ESCADRON DÉTECTÉ : {squad_name}", "#00FF66")
 
     # ==========================================
-    # NOUVEAU MODULE : CIBLAGE TACTIQUE (COVAS)
+    # MODULE CIBLAGE TACTIQUE OPTIMISÉ (PARE-FEU RÉSEAU)
     # ==========================================
     elif event == 'ShipTargeted':
+        global dernier_etat_cible
         target_locked = entry.get('TargetLocked', False)
         
         if target_locked:
@@ -804,17 +450,21 @@ def journal_entry(cmdr, is_beta, system, station, entry, state):
             if nom_joueur:
                 squad_tag = entry.get('SquadronID', '')
                 payload = json.dumps({"nom": nom_joueur, "tag": squad_tag})
-                threading.Thread(target=maj_generique_global, args=("TARGETED_CMDR", "SYS_CORE", payload, "INFO")).start()
-                
-                affichage_tag = f" [{squad_tag}]" if squad_tag else ""
-                mettre_a_jour_interface(f">_ CIBLE : CMDR {nom_joueur}{affichage_tag}", "#FF3333")
+                if payload != dernier_etat_cible:
+                    dernier_etat_cible = payload
+                    threading.Thread(target=maj_generique_global, args=("TARGETED_CMDR", "SYS_CORE", payload, "INFO")).start()
+                    affichage_tag = f" [{squad_tag}]" if squad_tag else ""
+                    mettre_a_jour_interface(f">_ CIBLE : CMDR {nom_joueur}{affichage_tag}", "#FF3333")
             else:
-                # Cible verrouillée mais non-joueur (PNJ, drone, balise...)
-                threading.Thread(target=maj_generique_global, args=("TARGETED_CMDR", "SYS_CORE", "LOST", "INFO")).start()
+                # Cible non-joueur : transmission de "LOST" uniquement si on ciblait un joueur auparavant
+                if dernier_etat_cible != "LOST":
+                    dernier_etat_cible = "LOST"
+                    threading.Thread(target=maj_generique_global, args=("TARGETED_CMDR", "SYS_CORE", "LOST", "INFO")).start()
         else:
-            # Déverrouillage complet (espace vide, station, astre sélectionné...)
-            threading.Thread(target=maj_generique_global, args=("TARGETED_CMDR", "SYS_CORE", "LOST", "INFO")).start()
-
+            # Déverrouillage complet : transmission de "LOST" uniquement si nécessaire
+            if dernier_etat_cible != "LOST":
+                dernier_etat_cible = "LOST"
+                threading.Thread(target=maj_generique_global, args=("TARGETED_CMDR", "SYS_CORE", "LOST", "INFO")).start()
 
     # ==========================================
     # STATUT LÉGAL
@@ -853,20 +503,10 @@ def journal_entry(cmdr, is_beta, system, station, entry, state):
         ship_name = entry.get('ShipName', 'VAISSEAU TACTIQUE')
         ship_id = str(entry.get('ShipID', '0'))
         ship_model = entry.get('Ship_Localised', entry.get('Ship', 'INCONNU')).title()
-        cargo_cap = entry.get('CargoCapacity', 0)
         
-        # --- ICI : On a retiré le vaisseau_id du payload ---
-        threading.Thread(target=patch_parametres, args=({"vaisseau_nom": ship_name.upper(), "vaisseau_modele": ship_model, "vaisseau_capacite": cargo_cap},)).start()
-        
+        threading.Thread(target=patch_parametres, args=({"vaisseau_nom": ship_name.upper(), "vaisseau_modele": ship_model},)).start()
         threading.Thread(target=maj_generique_global, args=("QG_REBUY", "QG_DATA", "ASSURANCE", "INFO", entry.get('Rebuy', 0))).start()
-        
-        modules = [{"slot": m.get('Slot', ''), "nom": m.get('Item_Localised', m.get('Item', '')).replace('_', ' ').title(), "grade": m.get('Engineering', {}).get('Level', 0)} for m in entry.get('Modules', [])]
-        threading.Thread(target=maj_generique_global, args=("QG_MODULES_" + ship_id, "QG_DATA", json.dumps(modules), "INFO")).start()
         threading.Thread(target=maj_generique_global, args=("QG_ACTIVE_SHIP_ID", "QG_DATA", ship_id, "INFO")).start()
-
-    elif event == 'StoredShips':
-        flotte = [{"id": str(s.get('ShipID')), "nom": s.get('Name', 'INCONNU'), "modele": s.get('ShipType_Localised', s.get('ShipType', 'INCONNU')).title(), "systeme": s.get('StarSystem', systeme_actuel)} for s in entry.get('ShipsHere', []) + entry.get('ShipsRemote', [])]
-        threading.Thread(target=maj_generique_global, args=("QG_FLEET", "QG_DATA", json.dumps(flotte), "INFO")).start()
 
     elif event == 'Statistics':
         bank = entry.get('Bank_Account', {})
@@ -878,39 +518,11 @@ def journal_entry(cmdr, is_beta, system, station, entry, state):
         if crime.get('Notoriety') is not None:
             threading.Thread(target=maj_generique_global, args=("QG_NOTORIETE", "QG_DATA", "NOTORIETE", "INFO", crime.get('Notoriety'))).start()
 
-    elif event == 'CargoTransfer':
-        for t in entry.get('Transfers', []):
-            ch = t.get('Count', 0) if t.get('Direction') == 'tocarrier' else -t.get('Count', 0)
-            maj_bdd_inventaire(formater_nom_marchandise(t.get('Type', '')), ch, relatif=True)
-            
-    elif event == 'CarrierStats':
-        cap = entry.get('SpaceUsage', {}).get('FreeSpace', 25000) + entry.get('SpaceUsage', {}).get('Cargo', 0)
-        threading.Thread(target=patch_parametres, args=({"fc_nom": f"[{entry.get('Callsign', 'XXXX')}] {entry.get('Name', 'CARRIER INCONNU')}", "fc_capacite": cap if cap > 0 else 25000, "possede_fc": True},)).start()
-        
-        fc_balance = entry.get('Finance', {}).get('CarrierBalance')
-        if fc_balance is not None: 
-            threading.Thread(target=maj_generique_global, args=("FC_BALANCE", "FINANCE", "BANK", "FINANCE", fc_balance)).start()
-        
-        stats_fc = {"fuel": entry.get('FuelLevel', 0), "crew": entry.get('Crew', []), "finance": entry.get('Finance', {})}
-        threading.Thread(target=maj_generique_global, args=("QG_CARRIER_STATS", "QG_DATA", json.dumps(stats_fc), "INFO")).start()
-        
-    elif event == 'Cargo':
-        if entry.get('Vessel') != 'SRV':
-            try:
-                requests.delete(f"{SUPABASE_URL}/rest/v1/radar_commercial?type_operation=eq.SHIP_CARGO", headers=get_headers())
-                for item in entry.get('Inventory', []):
-                    if item.get('Count', 0) > 0: 
-                        maj_generique_global(formater_nom_marchandise(item.get('Name', '')), "SHIP", "SHIP", "SHIP_CARGO", vol=item.get('Count', 0))
-            except: pass
-
-    elif event == 'MarketBuy': threading.Thread(target=enregistrer_transaction, args=(system, station, entry, "ACHAT")).start()
-    elif event == 'MarketSell': threading.Thread(target=enregistrer_transaction, args=(system, station, entry, "VENTE")).start()
-
     # ==========================================
     # MODULE BGS (SÉCURISÉ : GUERRES, HAUSSE & OPÉRATIONS)
     # ==========================================
     if not hasattr(journal_entry, 'bgs_cache'): 
-        journal_entry.bgs_cache = {'missions': {}, 'station_faction': ''}
+        journal_entry.bgs_cache = {'missions': {}, 'station_faction': '', 'ordres': [], 'ordres_ts': 0}
     
     # 1. Extraction robuste de la faction de la station (Texte ou Dictionnaire)
     if entry.get('event') in ['Docked', 'Location', 'ApproachSettlement']:
@@ -1102,14 +714,20 @@ def journal_entry(cmdr, is_beta, system, station, entry, state):
             
             # 4. LIAISON ET TRANSMISSION VERS SUPABASE
             try:
-                res_ordres = requests.get(f"{SUPABASE_URL}/rest/v1/ordres_bgs?statut=eq.ACTIF&select=id,faction_cible,systeme_cible,type_ordre", headers=get_headers(), timeout=5)
+                maintenant = time.time()
+                # Bouclier Egress : Lecture des ordres limitée à 1 fois toutes les 5 minutes
+                if maintenant - journal_entry.bgs_cache.get('ordres_ts', 0) > 300:
+                    res_ordres = requests.get(f"{SUPABASE_URL}/rest/v1/ordres_bgs?statut=eq.ACTIF&select=id,faction_cible,systeme_cible,type_ordre", headers=get_headers(), timeout=5)
+                    
+                    # DIAGNOSTIC 1 : Supabase refuse-t-il la lecture des ordres ?
+                    if res_ordres.status_code != 200:
+                        mettre_a_jour_interface(f">_ ERREUR LECTURE ORDRE : {res_ordres.status_code}", "red")
+                        return
+                        
+                    journal_entry.bgs_cache['ordres'] = res_ordres.json()
+                    journal_entry.bgs_cache['ordres_ts'] = maintenant
                 
-                # DIAGNOSTIC 1 : Supabase refuse-t-il la lecture des ordres ?
-                if res_ordres.status_code != 200:
-                    mettre_a_jour_interface(f">_ ERREUR LECTURE ORDRE : {res_ordres.status_code}", "red")
-                    return
-                
-                ordres_actifs = res_ordres.json()
+                ordres_actifs = journal_entry.bgs_cache.get('ordres', [])
                 
                 # DIAGNOSTIC 2 : La liste des ordres est-elle vide pour le plugin ?
                 if len(ordres_actifs) == 0:
@@ -1174,46 +792,3 @@ def journal_entry(cmdr, is_beta, system, station, entry, state):
                 mettre_a_jour_interface(f">_ ERREUR SCRIPT : {str(e)[:15]}", "red")
 
         threading.Thread(target=process_bgs_complet).start()
-
-def maj_bdd_inventaire(marchandise, quantite, relatif=True):
-    global inventaire_fc_local
-    if not marchandise:
-        return
-        
-    user_id = get_user_id()
-    if not user_id:
-        return
-
-    try:
-        with inventaire_lock:
-            if inventaire_fc_local is None:
-                inventaire_fc_local = {}
-                res = requests.get(f"{SUPABASE_URL}/rest/v1/inventaire_fc?user_id=eq.{user_id}", headers=get_headers())
-                if res.status_code == 200:
-                    for item in res.json(): 
-                        inventaire_fc_local[item.get('marchandise')] = item.get('quantite', 0)
-                        
-            nouvelle_qte = max(0, inventaire_fc_local.get(marchandise, 0) + quantite) if relatif else quantite
-            inventaire_fc_local[marchandise] = nouvelle_qte
-
-        if nouvelle_qte <= 0:
-            requests.delete(
-                f"{SUPABASE_URL}/rest/v1/inventaire_fc?user_id=eq.{user_id}&marchandise=eq.{urllib.parse.quote(marchandise)}", 
-                headers=get_headers()
-            )
-        else:
-            h = get_headers()
-            h["Prefer"] = "resolution=merge-duplicates"
-            payload = {
-                "user_id": user_id,
-                "marchandise": marchandise,
-                "quantite": nouvelle_qte,
-                "derniere_maj": datetime.now(timezone.utc).isoformat()
-            }
-            requests.post(
-                f"{SUPABASE_URL}/rest/v1/inventaire_fc?on_conflict=user_id,marchandise", 
-                headers=h, 
-                json=payload
-            )
-    except Exception as e:
-        pass
