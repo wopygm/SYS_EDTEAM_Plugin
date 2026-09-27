@@ -540,6 +540,14 @@ def journal_entry(cmdr, is_beta, system, station, entry, state):
         threading.Thread(target=maj_powerplay, args=(new_power, 0, 0, 0)).start()
 
     # ==========================================
+    # FLEET CARRIER (solde)
+    # ==========================================
+    elif event == 'CarrierStats':
+        solde_fc = entry.get('Finance', {}).get('CarrierBalance')
+        if solde_fc is not None:
+            threading.Thread(target=maj_generique_global, args=("FC_BALANCE", "FINANCE", "FC", "FINANCE", solde_fc)).start()
+
+    # ==========================================
     # INTERCEPTION ESCADRON / INDÉPENDANT
     # ==========================================
     elif event == 'SquadronStartup':
