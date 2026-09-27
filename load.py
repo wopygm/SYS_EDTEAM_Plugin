@@ -34,6 +34,7 @@ cached_user_id = None
 invalid_api_key = False
 dernier_solde_vaisseau = None
 dernier_etat_cible = "LOST"
+dernier_faction_escadron_envoyee = None
 
 # Cache pilote (Egress shield : 600s)
 pilot_cache = {
@@ -506,6 +507,18 @@ def journal_entry(cmdr, is_beta, system, station, entry, state):
             reps = {f['Name']: f['MyReputation'] for f in factions if 'MyReputation' in f}
             if reps:
                 threading.Thread(target=maj_generique_global, args=("QG_REPUTATIONS", "QG_DATA", json.dumps(reps), "INFO")).start()
+
+            # Capture automatique de la faction officielle de l'escadron (visible uniquement
+            # dans les systemes ou cette faction est active, via le flag SquadronFaction:true)
+            global dernier_faction_escadron_envoyee
+            faction_escadron = next((f.get('Name') for f in factions if f.get('SquadronFaction') is True), None)
+            if faction_escadron and faction_escadron != dernier_faction_escadron_envoyee:
+                infos_pilote = obtenir_infos_pilote()
+                esc_id = infos_pilote.get('escadron_id', '')
+                if esc_id:
+                    dernier_faction_escadron_envoyee = faction_escadron
+                    payload_esc = json.dumps({"escadron_id": esc_id, "faction": faction_escadron})
+                    threading.Thread(target=maj_generique_global, args=("QG_SQUADRON_FACTION", "QG_DATA", payload_esc, "INFO")).start()
 
             conflits = entry.get('Conflicts', [])
             sys_nom = entry.get('StarSystem') or systeme_actuel
