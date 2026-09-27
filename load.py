@@ -20,20 +20,43 @@ except ImportError:
     config = None
 
 plugin_name = "SYS.EDTEAM"
-PLUGIN_VERSION = "2.0"
+PLUGIN_VERSION = "2.1"
 
 SUPABASE_URL = "https://oailvdigfdoyfcydmabb.supabase.co"
 SUPABASE_KEY = "sb_publishable_AASqgRggHdIGttZHPGaWkA_VqrhuYNg"
 
 status_label = None
 systeme_actuel = "SYSTÈME INCONNU"
-cmdr_actuel = None # <-- NOUVELLE VARIABLE
+cmdr_actuel = None
 scan_en_cours = False
 dernier_solde_fc = None
 cached_user_id = None
 invalid_api_key = False
 dernier_solde_vaisseau = None
 dernier_etat_cible = "LOST"
+
+# Cache pilote (Egress shield : 600s)
+pilot_cache = {
+    'user_id': None,
+    'escadron_id': None,
+    'faction_alliee': None,
+    'faction_choisie': None,
+    'puissance_nom': None,
+    'puissance_rang': 0,
+    'puissance_merites_cycle': 0,
+    'puissance_merites_total': 0,
+    'ts': 0
+}
+
+# Matériaux industriels de colonisation / chantiers
+MATERIAUX_COLONISATION = {
+    'gold', 'titanium', 'beryllium', 'steel', 'aluminium', 'copper', 'lithium',
+    'cmmcomposite', 'ceramiccomposites', 'polymers', 'insulatingmembrane',
+    'coolinghoses', 'powergenerators', 'waterpurifiers', 'structuralregulators',
+    'atmosphericprocessors', 'buildingfabricators', 'computercomponents',
+    'superconductors', 'semiconductors', 'emergencypowercells',
+    'reinforcedmountingplate', 'microcontrollers', 'semiconductor', 'superconductor'
+}
 
 def trouver_journal_dir():
     if config and hasattr(config, 'get'):
@@ -45,15 +68,17 @@ def trouver_journal_dir():
 
 def lire_cle():
     try:
-        if os.path.exists(os.path.join(os.path.dirname(os.path.abspath(__file__)), "edteam_key.txt")):
-            with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "edteam_key.txt"), 'r') as f:
+        chemin = os.path.join(os.path.dirname(os.path.abspath(__file__)), "edteam_key.txt")
+        if os.path.exists(chemin):
+            with open(chemin, 'r') as f:
                 return f.read().strip()
     except: pass
     return ""
 
 def sauvegarder_cle(cle):
     try:
-        with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "edteam_key.txt"), 'w') as f:
+        chemin = os.path.join(os.path.dirname(os.path.abspath(__file__)), "edteam_key.txt")
+        with open(chemin, 'w') as f:
             f.write(cle.strip())
     except: pass
 
@@ -68,53 +93,221 @@ def get_headers():
         "User-Agent": f"SYS.EDTEAM/{cle}" if cle else "SYS.EDTEAM/NO_KEY"
     }
 
-# ==========================================
-# LE PONT DE COMMUNICATION
-# ==========================================
+def get_user_id():
+    global cached_user_id, invalid_api_key
+    if cached_user_id: 
+        return cached_user_id
+    if invalid_api_key:
+        return None
+        
+    cle = lire_cle()
+    if not cle:
+        mettre_a_jour_interface(">_ BLOQUÉ : AUCUNE CLÉ DANS EDMC", "red")
+        return None
+    try:
+        res = requests.get(f"{SUPABASE_URL}/rest/v1/profils?select=user_id", headers=get_headers(), timeout=5)
+        if res.status_code == 200:
+            data = res.json()
+            if len(data) > 0:
+                cached_user_id = data[0].get('user_id')
+                return cached_user_id
+            else:
+                mettre_a_jour_interface(">_ BLOQUÉ : CLÉ NON RECONNUE", "red")
+                invalid_api_key = True
+                return None
+        else:
+            mettre_a_jour_interface(f">_ ERREUR BDD : {res.status_code}", "red")
+            if res.status_code in [401, 403]:
+                invalid_api_key = True
+            return None
+    except:
+        mettre_a_jour_interface(">_ BLOQUÉ : ERREUR RÉSEAU", "red")
+    return None
+
+def obtenir_infos_pilote(force=False):
+    """Charge et met en cache pour 10 minutes les allégeances et la faction alliée."""
+    global pilot_cache
+    maintenant = time.time()
+    if not force and pilot_cache['user_id'] and (maintenant - pilot_cache['ts'] < 600):
+        return pilot_cache
+
+    uid = get_user_id()
+    if not uid: return pilot_cache
+
+    try:
+        res = requests.get(
+            f"{SUPABASE_URL}/rest/v1/profils?user_id=eq.{uid}&select=user_id,escadron_id,faction_choisie,puissance_nom,puissance_rang,puissance_merites_cycle,puissance_merites_total",
+            headers=get_headers(),
+            timeout=5
+        )
+        if res.status_code == 200 and res.json():
+            row = res.json()[0]
+            pilot_cache['user_id'] = uid
+            pilot_cache['escadron_id'] = row.get('escadron_id') or ''
+            pilot_cache['faction_choisie'] = row.get('faction_choisie') or ''
+            pilot_cache['puissance_nom'] = row.get('puissance_nom')
+            pilot_cache['puissance_rang'] = row.get('puissance_rang', 0)
+            pilot_cache['puissance_merites_cycle'] = row.get('puissance_merites_cycle', 0)
+            pilot_cache['puissance_merites_total'] = row.get('puissance_merites_total', 0)
+            pilot_cache['ts'] = maintenant
+
+            faction_trouvee = None
+            if pilot_cache['escadron_id']:
+                esc_id = pilot_cache['escadron_id'].strip()
+                res_esc = requests.get(
+                    f"{SUPABASE_URL}/rest/v1/escadrons?id=eq.{urllib.parse.quote(esc_id)}&select=nom_faction_officielle",
+                    headers=get_headers(),
+                    timeout=5
+                )
+                if res_esc.status_code == 200 and res_esc.json():
+                    faction_trouvee = res_esc.json()[0].get('nom_faction_officielle')
+
+            if not faction_trouvee and pilot_cache['faction_choisie']:
+                faction_trouvee = pilot_cache['faction_choisie']
+
+            pilot_cache['faction_alliee'] = faction_trouvee
+    except Exception as e:
+        logging.error(f"[SYS_EDTEAM] Erreur cache pilote : {e}")
+
+    return pilot_cache
+
 def patch_parametres(payload):
     uid = get_user_id()
     if not uid: return
     try:
-        res = requests.get(f"{SUPABASE_URL}/rest/v1/radar_commercial?select=id,station_name&target_commodity=eq.PARAM_UPDATE&user_id=eq.{uid}", headers=get_headers())
+        res = requests.get(f"{SUPABASE_URL}/rest/v1/radar_commercial?select=id,station_name&target_commodity=eq.PARAM_UPDATE&user_id=eq.{uid}", headers=get_headers(), timeout=5)
         if res.status_code == 200 and len(res.json()) > 0:
             row = res.json()[0]
             try: existing = json.loads(row.get('station_name', '{}'))
             except: existing = {}
             existing.update(payload)
-            requests.patch(f"{SUPABASE_URL}/rest/v1/radar_commercial?id=eq.{row['id']}", headers=get_headers(), json={"station_name": json.dumps(existing)})
+            requests.patch(f"{SUPABASE_URL}/rest/v1/radar_commercial?id=eq.{row['id']}", headers=get_headers(), json={"station_name": json.dumps(existing)}, timeout=5)
         else:
             data = {"user_id": uid, "system_name": "SYS_CORE", "station_name": json.dumps(payload), "target_commodity": "PARAM_UPDATE", "type_operation": "STATUS", "prix_unitaire": 0, "volume_disponible": 0, "distance": 0, "prix_moyen": 0}
-            requests.post(f"{SUPABASE_URL}/rest/v1/radar_commercial", headers=get_headers(), json=data)
+            requests.post(f"{SUPABASE_URL}/rest/v1/radar_commercial", headers=get_headers(), json=data, timeout=5)
     except: pass
 
 def maj_generique_global(target, system, station, type_op, val=0, vol=0):
     uid = get_user_id()
     if not uid: return
-    
+
     payload = {
         "user_id": uid,
-        "system_name": str(system), 
-        "station_name": str(station), 
-        "target_commodity": target, 
-        "type_operation": type_op, 
-        "prix_unitaire": int(val), 
-        "volume_disponible": int(vol), 
-        "distance": 0, 
+        "system_name": str(system),
+        "station_name": str(station),
+        "target_commodity": target,
+        "type_operation": type_op,
+        "prix_unitaire": int(val),
+        "volume_disponible": int(vol),
+        "distance": 0,
         "prix_moyen": 0
     }
     try:
-        # On ajoute user_id dans la recherche pour ne pas écraser les autres pilotes
-        res = requests.get(f"{SUPABASE_URL}/rest/v1/radar_commercial?select=id&target_commodity=eq.{target}&user_id=eq.{uid}", headers=get_headers())
+        res = requests.get(f"{SUPABASE_URL}/rest/v1/radar_commercial?select=id&target_commodity=eq.{target}&user_id=eq.{uid}", headers=get_headers(), timeout=5)
         if res.status_code == 200 and len(res.json()) > 0:
-            requests.patch(f"{SUPABASE_URL}/rest/v1/radar_commercial?id=eq.{res.json()[0]['id']}", headers=get_headers(), json=payload)
+            requests.patch(f"{SUPABASE_URL}/rest/v1/radar_commercial?id=eq.{res.json()[0]['id']}", headers=get_headers(), json=payload, timeout=5)
         else:
-            requests.post(f"{SUPABASE_URL}/rest/v1/radar_commercial", headers=get_headers(), json=payload)
+            requests.post(f"{SUPABASE_URL}/rest/v1/radar_commercial", headers=get_headers(), json=payload, timeout=5)
+    except: pass
+
+def maj_generique_batch(items):
+    """Variante groupee de maj_generique_global : un seul GET pour verifier l'existence
+    de plusieurs lignes (target_commodity=in.(...)) au lieu d'un GET par thread.
+    items : liste de dicts {target, system, station, type_op, val, vol}."""
+    uid = get_user_id()
+    if not uid or not items: return
+    try:
+        in_list = ",".join(it["target"] for it in items)
+        res = requests.get(f"{SUPABASE_URL}/rest/v1/radar_commercial?select=id,target_commodity&target_commodity=in.({in_list})&user_id=eq.{uid}", headers=get_headers(), timeout=5)
+        existants = {}
+        if res.status_code == 200:
+            for row in res.json():
+                existants[row['target_commodity']] = row['id']
+
+        for it in items:
+            payload = {
+                "user_id": uid,
+                "system_name": str(it["system"]),
+                "station_name": str(it["station"]),
+                "target_commodity": it["target"],
+                "type_operation": it["type_op"],
+                "prix_unitaire": int(it.get("val", 0)),
+                "volume_disponible": int(it.get("vol", 0)),
+                "distance": 0,
+                "prix_moyen": 0
+            }
+            if it["target"] in existants:
+                requests.patch(f"{SUPABASE_URL}/rest/v1/radar_commercial?id=eq.{existants[it['target']]}", headers=get_headers(), json=payload, timeout=5)
+            else:
+                requests.post(f"{SUPABASE_URL}/rest/v1/radar_commercial", headers=get_headers(), json=payload, timeout=5)
+    except: pass
+
+def maj_powerplay(puissance, rang, merites_cycle, merites_total):
+    """Met à jour le statut Powerplay 2.0 uniquement en cas de changement effectif."""
+    uid = get_user_id()
+    if not uid: return
+    infos = obtenir_infos_pilote()
+    
+    if (infos.get('puissance_nom') == puissance and 
+        infos.get('puissance_rang') == rang and 
+        abs(infos.get('puissance_merites_cycle', 0) - merites_cycle) < 5):
+        return
+
+    infos['puissance_nom'] = puissance
+    infos['puissance_rang'] = rang
+    infos['puissance_merites_cycle'] = merites_cycle
+    infos['puissance_merites_total'] = merites_total
+
+    # NE PAS ecrire directement dans 'profils' (aucune policy RLS UPDATE dessus,
+    # l'ecriture serait bloquee silencieusement). On passe par 'radar_commercial'
+    # comme les autres stats (finances, rangs) : un trigger cote serveur
+    # (automatisation_finances_radar) repercute ensuite vers profils.puissance_*.
+    payload = {
+        "user_id": uid,
+        "system_name": "QG_DATA",
+        "station_name": str(puissance) if puissance else '',
+        "target_commodity": "QG_POWERPLAY",
+        "type_operation": "INFO",
+        "prix_unitaire": int(rang),
+        "volume_disponible": int(merites_cycle),
+        "prix_moyen": float(merites_total),
+        "distance": 0
+    }
+    try:
+        res = requests.get(f"{SUPABASE_URL}/rest/v1/radar_commercial?select=id&target_commodity=eq.QG_POWERPLAY&user_id=eq.{uid}", headers=get_headers(), timeout=5)
+        if res.status_code == 200 and len(res.json()) > 0:
+            requests.patch(f"{SUPABASE_URL}/rest/v1/radar_commercial?id=eq.{res.json()[0]['id']}", headers=get_headers(), json=payload, timeout=5)
+        else:
+            requests.post(f"{SUPABASE_URL}/rest/v1/radar_commercial", headers=get_headers(), json=payload, timeout=5)
+    except: pass
+
+def notifier_journal_activite(type_act, details_txt, couleur_txt="#00F0FF"):
+    """Injection d'une brève marquante dans le QG (0 octet d'Egress via return=minimal)."""
+    uid = get_user_id()
+    if not uid: return
+    infos = obtenir_infos_pilote()
+    esc_id = infos.get('escadron_id') or "INDEPENDANT"
+    cmdr = cmdr_actuel or "CMDR"
+    try:
+        requests.post(
+            f"{SUPABASE_URL}/rest/v1/journal_activite",
+            headers=get_headers(),
+            json={
+                "escadron_id": esc_id,
+                "user_id": uid,
+                "cmdr_nom": cmdr,
+                "type_action": type_act,
+                "details": details_txt,
+                "couleur": couleur_txt
+            },
+            timeout=5
+        )
     except: pass
 
 def obtenir_parametres():
     cle = lire_cle()
     try:
-        res = requests.get(f"{SUPABASE_URL}/rest/v1/radar_commercial?target_commodity=eq.APP_PARAMS", headers=get_headers())
+        res = requests.get(f"{SUPABASE_URL}/rest/v1/radar_commercial?select=system_name,station_name&target_commodity=eq.APP_PARAMS", headers=get_headers(), timeout=5)
         if res.status_code == 200:
             for row in res.json():
                 if str(row.get('system_name')).strip() == str(cle).strip():
@@ -124,48 +317,17 @@ def obtenir_parametres():
 
 def obtenir_moyennes_galactiques():
     try:
-        res = requests.get(f"{SUPABASE_URL}/rest/v1/moyennes_galactiques", headers=get_headers())
+        res = requests.get(f"{SUPABASE_URL}/rest/v1/moyennes_galactiques?select=marchandise,prix_moyen", headers=get_headers(), timeout=5)
         if res.status_code == 200:
             return {m.get('marchandise'): m.get('prix_moyen', 0) for m in res.json()}
     except: pass
     return {}
 
-def get_user_id():
-    global cached_user_id, invalid_api_key
-    if cached_user_id: 
-        return cached_user_id
-    if invalid_api_key:
-        return None # <-- LE BOUCLIER : On stoppe l'hémorragie ici
-        
-    cle = lire_cle()
-    if not cle:
-        mettre_a_jour_interface(">_ BLOQUÉ : AUCUNE CLÉ DANS EDMC", "red")
-        return None
-    try:
-        res = requests.get(f"{SUPABASE_URL}/rest/v1/profils?select=user_id", headers=get_headers())
-        if res.status_code == 200:
-            data = res.json()
-            if len(data) > 0:
-                cached_user_id = data[0].get('user_id')
-                return cached_user_id
-            else:
-                mettre_a_jour_interface(">_ BLOQUÉ : CLÉ NON RECONNUE", "red")
-                invalid_api_key = True # <-- VERROUILLAGE
-                return None
-        else:
-            mettre_a_jour_interface(f">_ ERREUR BDD : {res.status_code}", "red")
-            if res.status_code in [401, 403]:
-                invalid_api_key = True # <-- VERROUILLAGE
-            return None
-    except:
-        mettre_a_jour_interface(">_ BLOQUÉ : ERREUR RÉSEAU", "red")
-    return None
-
 def recuperer_dernier_systeme_connu():
     global systeme_actuel
     if systeme_actuel != "SYSTÈME INCONNU" and systeme_actuel != "Sol": return systeme_actuel
     try:
-        res = requests.get(f"{SUPABASE_URL}/rest/v1/radar_commercial?target_commodity=eq.SYSTEM_STATUS", headers=get_headers())
+        res = requests.get(f"{SUPABASE_URL}/rest/v1/radar_commercial?select=system_name&target_commodity=eq.SYSTEM_STATUS", headers=get_headers(), timeout=5)
         if res.status_code == 200 and len(res.json()) > 0:
             sys_db = res.json()[0].get('system_name', '')
             if sys_db and sys_db not in ["SYSTÈME INCONNU", "SYS_CORE", "SHIP", "FINANCE", "Sol"]:
@@ -195,14 +357,11 @@ def heartbeat_loop():
                     if nouveau_solde is not None and nouveau_solde != dernier_solde_vaisseau: 
                         maj_generique_global("SHIP_BALANCE", "FINANCE", "BANK", "FINANCE", val=nouveau_solde)
                         dernier_solde_vaisseau = nouveau_solde
-        except: 
-            pass
-        time.sleep(60) # <-- On passe de 30s à 60s
+        except: pass
+        time.sleep(60)
 
 def check_for_updates():
-    global status_label  # <-- Permet de modifier le texte sur l'interface d'EDMC
-    # On attend 3 secondes pour laisser l'interface d'EDMC se construire
-    import time
+    global status_label
     time.sleep(3)
     try:
         url_version = "https://raw.githubusercontent.com/wopygm/SYS_EDTEAM_Plugin/main/version.txt"
@@ -211,11 +370,7 @@ def check_for_updates():
             latest_version = response.read().decode('utf-8').strip()
 
         if latest_version != PLUGIN_VERSION:
-            logging.info(f"SYS_EDTEAM : Mise à jour trouvée ! (v{PLUGIN_VERSION} -> v{latest_version})")
-            
-            # --- MESSAGE 1 : DÉBUT DE LA MAJ ---
-            try:
-                status_label.config(text=f"Téléchargement MAJ v{latest_version}...", fg="orange")
+            try: status_label.config(text=f"Téléchargement MAJ v{latest_version}...", fg="orange")
             except: pass
             
             url_zip = "https://github.com/wopygm/SYS_EDTEAM_Plugin/archive/refs/heads/main.zip"
@@ -228,34 +383,21 @@ def check_for_updates():
                 for file_info in z.infolist():
                     if file_info.is_dir() or file_info.filename.endswith("version.txt"):
                         continue
-                    
                     parts = file_info.filename.split('/')
                     if len(parts) > 1:
-                        relative_path = os.path.join(*parts[1:])
-                        target_path = os.path.join(this_dir, relative_path)
-                        
+                        target_path = os.path.join(this_dir, os.path.join(*parts[1:]))
                         os.makedirs(os.path.dirname(target_path), exist_ok=True)
                         with z.open(file_info) as source, open(target_path, "wb") as target:
                             target.write(source.read())
 
-            logging.info("SYS_EDTEAM : Mise à jour terminée avec succès.")
-            
-            # --- MESSAGE 2 : FIN DE LA MAJ ---
-            try:
-                status_label.config(text=f"MAJ v{latest_version} OK ! Redémarrez EDMC.", fg="#00FF66")
+            try: status_label.config(text=f"MAJ v{latest_version} OK ! Redémarrez EDMC.", fg="#00FF66")
             except: pass
-            
     except Exception as e:
-        logging.error(f"SYS_EDTEAM : Erreur lors de la maj : {e}")
+        logging.error(f"SYS_EDTEAM : Erreur maj : {e}")
 
-# ==========================================
-# BOOT SEQUENCE
-# ==========================================
 def plugin_start3(plugin_dir):
     threading.Thread(target=heartbeat_loop, daemon=True).start()
-    # On lance la vérification dans un processus séparé pour ne pas figer EDMC
     threading.Thread(target=check_for_updates, daemon=True).start()
-    
     return "SYS.EDTEAM"
 
 def plugin_app(parent):
@@ -278,30 +420,19 @@ def plugin_prefs(parent, cmdr, is_beta):
     return frame
 
 def sync_conflits_supabase(systeme, conflits):
-    """Envoie tous les conflits actifs détectés par l'éclaireur vers Supabase."""
     try:
         h = get_headers()
         h["Prefer"] = "resolution=merge-duplicates"
-        
         payloads = []
         now_iso = datetime.now(timezone.utc).isoformat()
         
         for c in conflits:
-            # On ignore uniquement si le conflit est expressément marqué en attente (pending)
-            statut = str(c.get("Status", "")).lower()
-            if statut == "pending":
-                continue
-            
-            f1 = c.get("Faction1", {})
-            f2 = c.get("Faction2", {})
-            f1_nom = f1.get("Name", "")
-            f2_nom = f2.get("Name", "")
-            
-            if not f1_nom or not f2_nom:
-                continue
+            if str(c.get("Status", "")).lower() == "pending": continue
+            f1, f2 = c.get("Faction1", {}), c.get("Faction2", {})
+            f1_nom, f2_nom = f1.get("Name", ""), f2.get("Name", "")
+            if not f1_nom or not f2_nom: continue
                 
             cle_conflit = f"{systeme}_{min(f1_nom, f2_nom)}_{max(f1_nom, f2_nom)}".replace(" ", "_")
-            
             payloads.append({
                 "id": cle_conflit,
                 "systeme": systeme,
@@ -316,20 +447,10 @@ def sync_conflits_supabase(systeme, conflits):
             })
             
         if payloads:
-            res = requests.post(
-                f"{SUPABASE_URL}/rest/v1/conflits_systemes?on_conflict=id",
-                headers=h,
-                json=payloads,
-                timeout=5
-            )
+            res = requests.post(f"{SUPABASE_URL}/rest/v1/conflits_systemes?on_conflict=id", headers=h, json=payloads, timeout=5)
             if res.status_code in [200, 201, 204]:
                 mettre_a_jour_interface(f">_ BGS : ÉCLAIREUR ({systeme.upper()})", "#00FF66")
-            else:
-                mettre_a_jour_interface(f">_ REJET BDD CONFLIT : {res.status_code}", "red")
-        else:
-            mettre_a_jour_interface(f">_ BGS : 0 CONFLIT RETENU", "orange")
     except Exception as e:
-        mettre_a_jour_interface(f">_ ERREUR SCRIPT CONFLIT", "red")
         logging.error(f"[SYS_EDTEAM] Erreur synchro conflits : {e}")
 
 # ==========================================
@@ -337,21 +458,17 @@ def sync_conflits_supabase(systeme, conflits):
 # ==========================================
 def journal_entry(cmdr, is_beta, system, station, entry, state):
     global systeme_actuel, cmdr_actuel
-    cmdr_actuel = cmdr # <-- ON ENREGISTRE TON NOM
+    cmdr_actuel = cmdr
     if system and system != systeme_actuel: systeme_actuel = system
     event = entry.get('event')
 
-    # ==========================================
-    # SUIVI TACTIQUE DES ZONES DE CONFLIT (CZ)
-    # ==========================================
+    # Suivi CZ
     if not hasattr(journal_entry, 'cz_cache'):
         journal_entry.cz_cache = {'intensity': 'S', 'points': 1, 'faction': '', 'won': False}
 
-    # Réinitialisation à la sortie ou au saut
     if event in ['SupercruiseEntry', 'FSDJump', 'CarrierJump', 'Location']:
         journal_entry.cz_cache = {'intensity': 'S', 'points': 1, 'faction': '', 'won': False}
 
-    # Détection de l'intensité au drop
     elif event == 'SupercruiseDestinationDrop':
         drop_type = str(entry.get('Type', '')).lower()
         if 'warzone' in drop_type or 'conflict' in drop_type:
@@ -366,16 +483,12 @@ def journal_entry(cmdr, is_beta, system, station, entry, state):
                 journal_entry.cz_cache['intensity'] = 'S'
                 journal_entry.cz_cache['points'] = 1.0
 
-    # Mémorisation du camp soutenu via les primes de combat et déduction de l'intensité au sol
     elif event == 'FactionKillBond':
         faction_alliee = entry.get('AwardingFaction')
         if faction_alliee:
             journal_entry.cz_cache['faction'] = faction_alliee
-            
-            # Si on tue une cible de grande valeur (Capitaine, SpecOps...), on monte l'intensité
             prime = entry.get('Reward', 0)
             actuel_pts = journal_entry.cz_cache.get('points', 1.0)
-            
             if prime >= 30000 and actuel_pts < 1.6:
                 journal_entry.cz_cache['intensity'] = 'H'
                 journal_entry.cz_cache['points'] = 1.6
@@ -386,26 +499,19 @@ def journal_entry(cmdr, is_beta, system, station, entry, state):
     if event in ['FSDJump', 'Location', 'CarrierJump', 'SupercruiseEntry', 'SupercruiseExit']:
         if event in ['FSDJump', 'Location', 'CarrierJump']:
             mettre_a_jour_interface(f">_ POSITION ACTUELLE : {systeme_actuel.upper()}", "#00F0FF")
-            # ÉMISSION CHIRURGICALE POUR COVAS (Uniquement au changement de système)
             threading.Thread(target=maj_generique_global, args=("SYSTEM_STATUS", systeme_actuel, "JUMP", "INFO")).start()
             
-        # NOUVEAU : Capture des réputations des factions locales
         if event in ['FSDJump', 'Location']:
             factions = entry.get('Factions', [])
-            reps = {}
-            for f in factions:
-                if 'MyReputation' in f:
-                    reps[f['Name']] = f['MyReputation']
+            reps = {f['Name']: f['MyReputation'] for f in factions if 'MyReputation' in f}
             if reps:
                 threading.Thread(target=maj_generique_global, args=("QG_REPUTATIONS", "QG_DATA", json.dumps(reps), "INFO")).start()
 
-                # INTERCEPTION ÉCLAIREUR : CONFLITS BGS (GUERRES & ÉLECTIONS)
             conflits = entry.get('Conflicts', [])
             sys_nom = entry.get('StarSystem') or systeme_actuel
             if conflits and sys_nom:
                 threading.Thread(target=sync_conflits_supabase, args=(sys_nom, conflits), daemon=True).start()
 
-        # 🚨 LE CORRECTIF : On force l'effacement de la cible
         threading.Thread(target=maj_generique_global, args=("TARGETED_CMDR", "SYS_CORE", "LOST", "INFO")).start()
 
     elif event == 'LoadGame':
@@ -414,12 +520,27 @@ def journal_entry(cmdr, is_beta, system, station, entry, state):
         possede_fc = entry.get('FleetCarrierID') is not None
         
         threading.Thread(target=patch_parametres, args=({"vaisseau_nom": ship_name.upper(), "vaisseau_modele": ship_model, "possede_fc": possede_fc},)).start()
-        
         threading.Thread(target=maj_generique_global, args=("CMDR_NAME", "SYS_CORE", cmdr, "STATUS")).start()
         threading.Thread(target=maj_generique_global, args=("QG_ACTIVE_SHIP_ID", "QG_DATA", str(entry.get('ShipID', '0')), "INFO")).start()
+        threading.Thread(target=obtenir_infos_pilote, args=(True,)).start()
 
     # ==========================================
-    # NOUVEAU MODULE : INTERCEPTION ESCADRON
+    # POWERPLAY 2.0
+    # ==========================================
+    elif event == 'Powerplay':
+        power = entry.get('Power')
+        rank = entry.get('Rank', 0)
+        merits_cycle = entry.get('Merits', 0)
+        merits_total = entry.get('TotalMerits', merits_cycle)
+        if power:
+            threading.Thread(target=maj_powerplay, args=(power, rank, merits_cycle, merits_total)).start()
+
+    elif event in ['PowerplayLeave', 'PowerplayDefect']:
+        new_power = entry.get('NewPower') if event == 'PowerplayDefect' else None
+        threading.Thread(target=maj_powerplay, args=(new_power, 0, 0, 0)).start()
+
+    # ==========================================
+    # INTERCEPTION ESCADRON / INDÉPENDANT
     # ==========================================
     elif event == 'SquadronStartup':
         squad_name = entry.get('SquadronName', '')
@@ -428,11 +549,14 @@ def journal_entry(cmdr, is_beta, system, station, entry, state):
         if squad_name:
             payload = json.dumps({"nom": squad_name, "rank": squad_rank})
             threading.Thread(target=maj_generique_global, args=("SQUADRON_INFO", "QG_DATA", payload, "INFO")).start()
-            mettre_a_jour_interface(f">_ ESCADRON DÉTECTÉ : {squad_name}", "#00FF66")
+            mettre_a_jour_interface(f">_ ESCADRON : {squad_name}", "#00FF66")
+        else:
+            payload = json.dumps({"nom": "", "rank": 0, "independant": True})
+            threading.Thread(target=maj_generique_global, args=("SQUADRON_INFO", "QG_DATA", payload, "INFO")).start()
+            mettre_a_jour_interface(">_ STATUT : INDÉPENDANT", "#00F0FF")
+        threading.Thread(target=obtenir_infos_pilote, args=(True,)).start()
 
-    # ==========================================
-    # MODULE CIBLAGE TACTIQUE OPTIMISÉ (PARE-FEU RÉSEAU)
-    # ==========================================
+    # CIBLAGE TACTIQUE
     elif event == 'ShipTargeted':
         global dernier_etat_cible
         target_locked = entry.get('TargetLocked', False)
@@ -440,7 +564,6 @@ def journal_entry(cmdr, is_beta, system, station, entry, state):
         if target_locked:
             pilot_name_loc = entry.get('PilotName_Localised', '')
             pilot_name = entry.get('PilotName', '')
-            
             nom_joueur = ""
             if pilot_name_loc.upper().startswith("CMDR "):
                 nom_joueur = pilot_name_loc[5:].strip().upper()
@@ -456,54 +579,34 @@ def journal_entry(cmdr, is_beta, system, station, entry, state):
                     affichage_tag = f" [{squad_tag}]" if squad_tag else ""
                     mettre_a_jour_interface(f">_ CIBLE : CMDR {nom_joueur}{affichage_tag}", "#FF3333")
             else:
-                # Cible non-joueur : transmission de "LOST" uniquement si on ciblait un joueur auparavant
                 if dernier_etat_cible != "LOST":
                     dernier_etat_cible = "LOST"
                     threading.Thread(target=maj_generique_global, args=("TARGETED_CMDR", "SYS_CORE", "LOST", "INFO")).start()
         else:
-            # Déverrouillage complet : transmission de "LOST" uniquement si nécessaire
             if dernier_etat_cible != "LOST":
                 dernier_etat_cible = "LOST"
                 threading.Thread(target=maj_generique_global, args=("TARGETED_CMDR", "SYS_CORE", "LOST", "INFO")).start()
 
-    # ==========================================
-    # STATUT LÉGAL
-    # ==========================================
     if entry.get('Notoriety') is not None:
         threading.Thread(target=maj_generique_global, args=("QG_NOTORIETE", "QG_DATA", "NOTORIETE", "INFO", entry.get('Notoriety'))).start()
-    
 
     if event in ['Rank', 'Progress']:
-        
-        # ==========================================
-        # 1. RANGS ET PROGRESSION
-        # ==========================================
-        if event == 'Rank':
-            for r in ['Combat', 'Trade', 'Explore', 'Federation', 'Empire', 'Exobiologist']:
-                if entry.get(r) is not None: 
-                    threading.Thread(target=maj_generique_global, args=(f"QG_RANK_{r.upper()[:6]}", "QG_DATA", r.upper(), "INFO", entry.get(r))).start()
-            
-            val_mercenary = entry.get('Soldier') if entry.get('Soldier') is not None else entry.get('Mercenary')
-            if val_mercenary is not None:
-                threading.Thread(target=maj_generique_global, args=("QG_RANK_MERCEN", "QG_DATA", "MERCENARY", "INFO", val_mercenary)).start()
-                    
-        elif event == 'Progress':
-            for r in ['Combat', 'Trade', 'Explore', 'Federation', 'Empire', 'Exobiologist']:
-                if entry.get(r) is not None: 
-                    threading.Thread(target=maj_generique_global, args=(f"QG_PROG_{r.upper()[:6]}", "QG_DATA", r.upper(), "INFO", entry.get(r))).start()
-            
-            prog_mercenary = entry.get('Soldier') if entry.get('Soldier') is not None else entry.get('Mercenary')
-            if prog_mercenary is not None:
-                threading.Thread(target=maj_generique_global, args=("QG_PROG_MERCEN", "QG_DATA", "MERCENARY", "INFO", prog_mercenary)).start()
-            
-            if entry.get('Soldier') is not None:
-                threading.Thread(target=maj_generique_global, args=("QG_PROG_MERCEN", "QG_DATA", "MERCENARY", "INFO", entry.get('Soldier'))).start()
+        prefix = "RANK" if event == 'Rank' else "PROG"
+        items = []
+        for r in ['Combat', 'Trade', 'Explore', 'Federation', 'Empire', 'Exobiologist']:
+            if entry.get(r) is not None:
+                items.append({"target": f"QG_{prefix}_{r.upper()[:6]}", "system": "QG_DATA", "station": r.upper(), "type_op": "INFO", "val": entry.get(r)})
+        val_mercenary = entry.get('Soldier') if entry.get('Soldier') is not None else entry.get('Mercenary')
+        if val_mercenary is not None:
+            items.append({"target": f"QG_{prefix}_MERCEN", "system": "QG_DATA", "station": "MERCENARY", "type_op": "INFO", "val": val_mercenary})
+        if items:
+            # Un seul thread, un seul GET groupe (au lieu de jusqu'a 7 threads x 1 GET chacun)
+            threading.Thread(target=maj_generique_batch, args=(items,)).start()
 
     elif event == 'Loadout':
         ship_name = entry.get('ShipName', 'VAISSEAU TACTIQUE')
         ship_id = str(entry.get('ShipID', '0'))
         ship_model = entry.get('Ship_Localised', entry.get('Ship', 'INCONNU')).title()
-        
         threading.Thread(target=patch_parametres, args=({"vaisseau_nom": ship_name.upper(), "vaisseau_modele": ship_model},)).start()
         threading.Thread(target=maj_generique_global, args=("QG_REBUY", "QG_DATA", "ASSURANCE", "INFO", entry.get('Rebuy', 0))).start()
         threading.Thread(target=maj_generique_global, args=("QG_ACTIVE_SHIP_ID", "QG_DATA", ship_id, "INFO")).start()
@@ -512,19 +615,16 @@ def journal_entry(cmdr, is_beta, system, station, entry, state):
         bank = entry.get('Bank_Account', {})
         threading.Thread(target=maj_generique_global, args=("QG_WEALTH", "QG_DATA", "WEALTH", "INFO", bank.get('Current_Wealth', 0))).start()
         threading.Thread(target=maj_generique_global, args=("QG_SHIPS_VALUE", "QG_DATA", "SHIPS", "INFO", bank.get('Spent_On_Ships', 0) + bank.get('Spent_On_Outfitting', 0))).start()
-        
-        # --- AJOUT : Capture de la notoriété au démarrage ---
         crime = entry.get('Crime', {})
         if crime.get('Notoriety') is not None:
             threading.Thread(target=maj_generique_global, args=("QG_NOTORIETE", "QG_DATA", "NOTORIETE", "INFO", crime.get('Notoriety'))).start()
 
     # ==========================================
-    # MODULE BGS (SÉCURISÉ : GUERRES, HAUSSE & OPÉRATIONS)
+    # MODULE BGS, SOUTIEN LIBRE & COLONISATION
     # ==========================================
     if not hasattr(journal_entry, 'bgs_cache'): 
         journal_entry.bgs_cache = {'missions': {}, 'station_faction': '', 'ordres': [], 'ordres_ts': 0}
     
-    # 1. Extraction robuste de la faction de la station (Texte ou Dictionnaire)
     if entry.get('event') in ['Docked', 'Location', 'ApproachSettlement']:
         faction_info = entry.get('StationFaction') or entry.get('SystemFaction')
         if isinstance(faction_info, dict):
@@ -532,13 +632,11 @@ def journal_entry(cmdr, is_beta, system, station, entry, state):
         elif isinstance(faction_info, str):
             journal_entry.bgs_cache['station_faction'] = faction_info
 
-    # 2. Mémorisation des missions acceptées
     if entry.get('event') == 'MissionAccepted': 
         m_id = entry.get('MissionID')
         m_name = entry.get('Name', '').lower()
         est_combat = any(k in m_name for k in ['massacre', 'assassin', 'kill', 'pirat', 'combat', 'destroy', 'skimmer'])
         est_pirate = any(k in m_name for k in ['pirat', 'deserter', 'anarchy'])
-        
         if m_id:
             journal_entry.bgs_cache['missions'][m_id] = {
                 'faction': entry.get('Faction', ''),
@@ -548,13 +646,12 @@ def journal_entry(cmdr, is_beta, system, station, entry, state):
                 'is_pirate': est_pirate
             }
 
-    # 3. Liste complète des événements surveillés
     bgs_events = [
         'MissionCompleted', 'MissionFailed', 'MissionAbandoned', 
         'MarketSell', 'RedeemVoucher', 'SellExplorationData', 
         'MultiSellExplorationData', 'SellOrganicData', 'CommitCrime', 
         'CollectItem', 'CollectItems', 'DataDownloaded', 'BackpackChange', 
-        'Music', 'ReceiveText', 'Embark', 'BookDropship'
+        'Music', 'ReceiveText', 'Embark', 'BookDropship', 'CargoDepot'
     ]
 
     if entry.get('event') in bgs_events:
@@ -562,43 +659,35 @@ def journal_entry(cmdr, is_beta, system, station, entry, state):
             user_id = get_user_id()
             if not user_id: return
             
+            infos_pilote = obtenir_infos_pilote()
+            faction_alliee = infos_pilote.get('faction_alliee', '')
+            
             evt = entry.get('event')
             actions = []
             
-            # Récupération de la faction de la station (avec repli sur l'état EDMC)
             f_station = journal_entry.bgs_cache.get('station_faction', '')
             if not f_station and state:
                 st_state = state.get('StationFaction')
                 if isinstance(st_state, dict): f_station = st_state.get('Name', '')
                 elif isinstance(st_state, str): f_station = st_state
 
-            # A. VICTOIRE EN ZONE DE CONFLIT (SPATIALE & TERRESTRE)
             victoire_cz = False
-            
-            # 1. Combat au sol (Odyssey - piste musicale si disponible)
             if evt == 'Music':
                 track = str(entry.get('MusicTrack', '')).lower()
                 if 'conflictzone' in track and ('win' in track or 'victory' in track):
                     victoire_cz = True
-
-            # 2. Combat spatial (Déclencheur d'origine restauré)
             elif evt == 'ReceiveText':
                 msg = str(entry.get('Message', '')).lower()
-                # On réactive ton déclencheur qui marche à tous les coups
                 if '$military_passthrough' in msg or 'warzone_pointrace_win' in msg:
                     victoire_cz = True
-
-            # 3. Combat au sol (Déclencheur de repli)
             elif evt in ['Embark', 'BookDropship']:
                 victoire_cz = True
 
-            # 4. Validation avec verrou anti-doublon (Exige d'avoir touché des primes)
             f_combat = journal_entry.cz_cache.get('faction', '')
             if victoire_cz and not journal_entry.cz_cache.get('won', False) and f_combat != '':
                 journal_entry.cz_cache['won'] = True
                 pts = journal_entry.cz_cache.get('points', 1.0)
                 intensite = journal_entry.cz_cache.get('intensity', 'S')
-
                 actions.append({
                     "faction": f_combat, 
                     "type": "CZ_VICTOIRES", 
@@ -608,7 +697,6 @@ def journal_entry(cmdr, is_beta, system, station, entry, state):
                     "is_combat": True
                 })
 
-            # B. VALIDATION DE MISSION
             elif evt == 'MissionCompleted': 
                 inf_val = 1
                 for fe in entry.get('FactionEffects', []):
@@ -618,7 +706,6 @@ def journal_entry(cmdr, is_beta, system, station, entry, state):
                                 inf_val = inf.get('Influence').count('+')
                                 break
                         break
-                
                 m_id = entry.get('MissionID')
                 m_info = journal_entry.bgs_cache.get('missions', {}).get(m_id, {})
                 m_faction = m_info.get('faction') if isinstance(m_info, dict) else (m_info or entry.get('Faction', ''))
@@ -637,31 +724,22 @@ def journal_entry(cmdr, is_beta, system, station, entry, state):
                     "is_pirate": m_is_pirate
                 })
 
-            # C. MISSIONS ÉCHOUÉES OU ABANDONNÉES
             elif evt in ['MissionFailed', 'MissionAbandoned']:
                 m_id = entry.get('MissionID')
                 m_info = journal_entry.bgs_cache.get('missions', {}).get(m_id, {})
-                
-                # Système anti-doublon : on ignore si la mission a déjà été marquée
-                if isinstance(m_info, dict) and m_info.get('deja_compte'):
-                    pass
-                else:
-                    if isinstance(m_info, dict):
-                        m_info['deja_compte'] = True # On verrouille pour le prochain événement
-                        
+                if not (isinstance(m_info, dict) and m_info.get('deja_compte')):
+                    if isinstance(m_info, dict): m_info['deja_compte'] = True
                     f = m_info.get('faction') if isinstance(m_info, dict) else (m_info or '')
                     s = m_info.get('system') if isinstance(m_info, dict) else systeme_actuel
                     if f: 
                         actions.append({"faction": f, "type": "ECHECS", "valeur": 1, "system": s, "is_combat": False})
 
-            # D. OBLIGATIONS DE COMBAT ET PRIMES
             elif evt == 'RedeemVoucher' and entry.get('Type') in ['bounty', 'CombatBond']:
                 for f_info in entry.get('Factions', []): 
                     actions.append({"faction": f_info.get('Faction', ''), "type": "SECURITE", "valeur": f_info.get('Amount', 0), "system": systeme_actuel, "is_combat": True})
                 if entry.get('Faction') and entry.get('Amount'): 
                     actions.append({"faction": entry.get('Faction', ''), "type": "SECURITE", "valeur": entry.get('Amount', 0), "system": systeme_actuel, "is_combat": True})
 
-            # E. DONNÉES SCIENTIFIQUES (Cartographie & Exobiologie Vista Genomics)
             elif evt in ['SellExplorationData', 'MultiSellExplorationData', 'SellOrganicData']:
                 val = 0
                 if evt == 'SellOrganicData':
@@ -672,123 +750,149 @@ def journal_entry(cmdr, is_beta, system, station, entry, state):
                     val = entry.get('TotalEarnings', entry.get('BaseValue', 0))
                     if evt == 'SellExplorationData' and 'TotalEarnings' not in entry:
                         val += entry.get('Bonus', 0)
-
                 if val > 0: 
                     actions.append({"faction": f_station, "type": "SCIENCE", "valeur": val, "system": systeme_actuel, "is_combat": False})
 
-            # F. COMMERCE & MARCHÉ NOIR
+            # Commerce & Matériaux de colonisation
             elif evt == 'MarketSell':
                 val = entry.get('TotalSale', 0)
-                if val > 0: 
-                    actions.append({"faction": f_station, "type": "CONTREBANDE" if (entry.get('Stolen', False) or entry.get('IllegalGoods', False)) else "ECONOMIE", "valeur": val, "system": systeme_actuel, "is_combat": False})
+                count = entry.get('Count', 0)
+                mat_raw = str(entry.get('Type', '')).lower().replace(' ', '').replace('$', '').replace('_name;', '')
+                mat_nom = entry.get('Type_Localised') or entry.get('Type', 'Matériaux')
+                
+                # Détection colonisation au tonnage
+                if count > 0 and mat_raw in MATERIAUX_COLONISATION and f_station:
+                    actions.append({
+                        "faction": f_station, 
+                        "type": "COLONISATION", 
+                        "valeur": count, 
+                        "details": str(mat_nom), 
+                        "system": systeme_actuel, 
+                        "is_combat": False
+                    })
 
-            # G. CRIMES ET SABOTAGES
+                if val > 0: 
+                    actions.append({
+                        "faction": f_station, 
+                        "type": "CONTREBANDE" if (entry.get('Stolen', False) or entry.get('IllegalGoods', False)) else "ECONOMIE", 
+                        "valeur": val, 
+                        "system": systeme_actuel, 
+                        "is_combat": False
+                    })
+
+            # Déchargement de fret / dépôts de chantiers coloniaux
+            elif evt == 'CargoDepot' and entry.get('UpdateType') == 'Deliver':
+                count = entry.get('Count', 0)
+                mat_nom = entry.get('CargoType_Localised') or entry.get('CargoType', 'Fret colonial')
+                if count > 0 and f_station:
+                    actions.append({
+                        "faction": f_station,
+                        "type": "COLONISATION",
+                        "valeur": count,
+                        "details": str(mat_nom),
+                        "system": systeme_actuel,
+                        "is_combat": False
+                    })
+
             elif evt == 'CommitCrime' and 'murder' in str(entry.get('CrimeType', '')).lower():
                 faction_victime = entry.get('Faction', '') or f_station
                 if faction_victime: 
                     actions.append({"faction": faction_victime, "type": "MEURTRES", "valeur": 1, "system": systeme_actuel, "is_combat": True})
 
             elif evt in ['CollectItem', 'CollectItems']:
-                nom_item = entry.get('Name', '').lower()
-                if 'powerregulator' in nom_item and f_station:
+                if 'powerregulator' in entry.get('Name', '').lower() and f_station:
                     actions.append({"faction": f_station, "type": "VOLS", "valeur": 1, "system": systeme_actuel, "is_combat": False})
 
-            elif evt == 'DataDownloaded':
-                if f_station:
-                    actions.append({"faction": f_station, "type": "PIRATAGE", "valeur": 1, "system": systeme_actuel, "is_combat": False})
+            elif evt == 'DataDownloaded' and f_station:
+                actions.append({"faction": f_station, "type": "PIRATAGE", "valeur": 1, "system": systeme_actuel, "is_combat": False})
 
-            # LE FILET DE SÉCURITÉ ODYSSEY (Écoute des ajouts silencieux dans le sac à dos)
             elif evt == 'BackpackChange':
-                ajouts = entry.get('Added', [])
-                for ajout in ajouts:
+                for ajout in entry.get('Added', []):
                     nom_ajout = ajout.get('Name', '').lower()
-                    type_ajout = ajout.get('Type', '')
-                    
-                    # 1. Détection du régulateur volé
                     if 'powerregulator' in nom_ajout and f_station:
-                         actions.append({"faction": f_station, "type": "VOLS", "valeur": ajout.get('Count', 1), "system": systeme_actuel, "is_combat": False})
-                    
-                    # 2. Détection du piratage de données (On filtre les consommables classiques)
-                    elif type_ajout == 'Data' and f_station:
-                         actions.append({"faction": f_station, "type": "PIRATAGE", "valeur": ajout.get('Count', 1), "system": systeme_actuel, "is_combat": False})
+                        actions.append({"faction": f_station, "type": "VOLS", "valeur": ajout.get('Count', 1), "system": systeme_actuel, "is_combat": False})
+                    elif ajout.get('Type') == 'Data' and f_station:
+                        actions.append({"faction": f_station, "type": "PIRATAGE", "valeur": ajout.get('Count', 1), "system": systeme_actuel, "is_combat": False})
             
-            # 4. LIAISON ET TRANSMISSION VERS SUPABASE
+            # Transmission filtrée (Egress Shield)
             try:
                 maintenant = time.time()
-                # Bouclier Egress : Lecture des ordres limitée à 1 fois toutes les 5 minutes
                 if maintenant - journal_entry.bgs_cache.get('ordres_ts', 0) > 300:
                     res_ordres = requests.get(f"{SUPABASE_URL}/rest/v1/ordres_bgs?statut=eq.ACTIF&select=id,faction_cible,systeme_cible,type_ordre", headers=get_headers(), timeout=5)
-                    
-                    # DIAGNOSTIC 1 : Supabase refuse-t-il la lecture des ordres ?
-                    if res_ordres.status_code != 200:
-                        mettre_a_jour_interface(f">_ ERREUR LECTURE ORDRE : {res_ordres.status_code}", "red")
-                        return
-                        
-                    journal_entry.bgs_cache['ordres'] = res_ordres.json()
-                    journal_entry.bgs_cache['ordres_ts'] = maintenant
-                
+                    if res_ordres.status_code == 200:
+                        journal_entry.bgs_cache['ordres'] = res_ordres.json()
+                        journal_entry.bgs_cache['ordres_ts'] = maintenant
+
                 ordres_actifs = journal_entry.bgs_cache.get('ordres', [])
-                
-                # DIAGNOSTIC 2 : La liste des ordres est-elle vide pour le plugin ?
-                if len(ordres_actifs) == 0:
-                    mettre_a_jour_interface(">_ AUCUN ORDRE ACTIF TROUVÉ (RLS?)", "orange")
-                    return
 
                 for action in actions:
                     sys_cible_action = action.get('system', systeme_actuel).strip().lower()
+                    act_faction = str(action.get('faction', '')).strip().lower()
                     ordre_valide = None
 
-                    # CAS 1 : Victoire en Zone de Conflit (Stricte sur Système ET Faction)
-                    if action['type'] == 'CZ_VICTOIRES':
-                        if action.get('faction'):
-                            ordre_valide = next((o for o in ordres_actifs if o.get('type_ordre') == 'GUERRE' and o.get('systeme_cible', '').strip().lower() == sys_cible_action and o.get('faction_cible', '').strip().lower() == action['faction'].strip().lower()), None)
+                    if action['type'] == 'CZ_VICTOIRES' and act_faction:
+                        ordre_valide = next((o for o in ordres_actifs if o.get('type_ordre') == 'GUERRE' and o.get('systeme_cible', '').strip().lower() == sys_cible_action and o.get('faction_cible', '').strip().lower() == act_faction), None)
+                    elif act_faction:
+                        ordre_valide = next((o for o in ordres_actifs if o.get('faction_cible', '').strip().lower() == act_faction and o.get('systeme_cible', '').strip().lower() == sys_cible_action), None)
 
-                    # CAS 2 : Actions standards (Stricte sur la Faction ET le Système)
-                    else:
-                        if action['faction']:
-                            ordre_valide = next((o for o in ordres_actifs if o.get('faction_cible', '').strip().lower() == action['faction'].strip().lower() and o.get('systeme_cible', '').strip().lower() == sys_cible_action), None)
+                    # Est-ce un soutien libre pour notre faction alliée ?
+                    est_action_libre = False
+                    if not ordre_valide and faction_alliee and act_faction == faction_alliee.strip().lower():
+                        est_action_libre = True
 
-                    if ordre_valide:
-                        # Filtres ignorés
-                        if ordre_valide.get('type_ordre') == 'ELECTION' and action.get('is_combat', False): continue
-                        if ordre_valide.get('type_ordre') == 'GUERRE' and action['type'] == 'MISSIONS':
-                            if action.get('is_combat', False):
-                                dest = action.get('dest_system', sys_cible_action).strip().lower()
-                                sys_guerre = ordre_valide.get('systeme_cible', '').strip().lower()
-                                if dest != sys_guerre or action.get('is_pirate', False): continue
-                            valeur_finale = 1
+                    if ordre_valide or est_action_libre:
+                        if ordre_valide:
+                            if ordre_valide.get('type_ordre') == 'ELECTION' and action.get('is_combat', False): continue
+                            if ordre_valide.get('type_ordre') == 'GUERRE' and action['type'] == 'MISSIONS':
+                                if action.get('is_combat', False):
+                                    dest = action.get('dest_system', sys_cible_action).strip().lower()
+                                    if dest != ordre_valide.get('systeme_cible', '').strip().lower() or action.get('is_pirate', False): continue
+                                valeur_finale = 1
+                            else:
+                                valeur_finale = action['valeur']
                         else:
                             valeur_finale = action['valeur']
 
-                        # ENVOI À SUPABASE
-                        res_post = requests.post(
-                            f"{SUPABASE_URL}/rest/v1/efforts_bgs", 
-                            headers=get_headers(), 
-                            json={
-                                "user_id": user_id, 
-                                "ordre_id": ordre_valide['id'], 
-                                "type_action": action['type'], 
-                                "valeur": valeur_finale, 
-                                "date_action": entry.get('timestamp', datetime.now(timezone.utc).isoformat())
-                            }, 
-                            timeout=5
-                        )
+                        payload = {
+                            "user_id": user_id, 
+                            "ordre_id": ordre_valide['id'] if ordre_valide else None, 
+                            "type_action": action['type'], 
+                            "valeur": valeur_finale, 
+                            "systeme": action.get('system', systeme_actuel),
+                            "faction": action.get('faction', ''),
+                            "details": action.get('details', None),
+                            "date_action": entry.get('timestamp', datetime.now(timezone.utc).isoformat())
+                        }
+
+                        res_post = requests.post(f"{SUPABASE_URL}/rest/v1/efforts_bgs", headers=get_headers(), json=payload, timeout=5)
                         
-                        # DIAGNOSTIC 3 : Supabase a-t-il accepté l'insertion ?
                         if res_post.status_code in [200, 201, 204]:
-                            if action['type'] == 'CZ_VICTOIRES':
-                                intensite_label = action.get('intensite', 'S')
-                                noms_cz = {'H': 'HAUTE', 'M': 'MOYENNE', 'S': 'FAIBLE'}
-                                label_cz = noms_cz.get(intensite_label, intensite_label)
-                                mettre_a_jour_interface(f">_ BGS : CZ {label_cz} +{action['valeur']} PTS", "#FFD700")
+                            if ordre_valide:
+                                mettre_a_jour_interface(f">_ BGS [ORDRE #{ordre_valide['id']}] : {action['type']} +{int(valeur_finale)}", "#00FF66")
+                            elif action['type'] == 'COLONISATION':
+                                mettre_a_jour_interface(f">_ BÂTISSEUR : +{int(valeur_finale)} T DE FRET", "#FFD700")
                             else:
-                                mettre_a_jour_interface(f">_ BGS : {action['type']} ENREGISTRÉ", "#00FF66")
+                                mettre_a_jour_interface(f">_ SOUTIEN LIBRE : {action['type']} (+{int(valeur_finale)})", "#00FF66")
+
+                            # Brèves QG narratives (seuils sélectifs)
+                            if action['type'] == 'COLONISATION' and valeur_finale >= 200:
+                                threading.Thread(target=notifier_journal_activite, args=("COLONISATION", f"Livraison logistique : +{int(valeur_finale)} t ({action.get('details', 'Matériaux')})", "#FFD700")).start()
+                            elif action['type'] == 'CZ_VICTOIRES':
+                                threading.Thread(target=notifier_journal_activite, args=("COMBAT", f"Victoire en zone de conflit ({action.get('intensite', 'S')}) à {systeme_actuel}", "#FF3333")).start()
+                            elif action['type'] == 'MISSIONS' and valeur_finale >= 3:
+                                threading.Thread(target=notifier_journal_activite, args=("SOUTIEN", f"Mission navale validée (+{int(valeur_finale)} INF) pour la flotte", "#00FF66")).start()
+                            elif action['type'] == 'SCIENCE' and valeur_finale >= 5000000:
+                                threading.Thread(target=notifier_journal_activite, args=("SCIENCE", f"Données stellaires / bio versées ({valeur_finale/1000000:.1f}M CR)", "#00F0FF")).start()
+                            elif action['type'] == 'SECURITE' and valeur_finale >= 2000000:
+                                threading.Thread(target=notifier_journal_activite, args=("SECURITE", f"Primes et obligations encaissées ({valeur_finale/1000000:.1f}M CR)", "#FF6600")).start()
+                            elif action['type'] == 'ECONOMIE' and valeur_finale >= 5000000:
+                                threading.Thread(target=notifier_journal_activite, args=("COMMERCE", f"Apport commercial de grande envergure ({valeur_finale/1000000:.1f}M CR)", "#00F0FF")).start()
                         else:
                             mettre_a_jour_interface(f">_ REJET EFFORT : {res_post.status_code}", "red")
                     else:
-                        # DIAGNOSTIC 4 : Le système ou la faction ne correspond pas
-                        mettre_a_jour_interface(f">_ BGS : AUCUN ORDRE CORRESPONDANT", "orange")
+                        # Action pour une faction tierce sans intérêt : silence radio, 0 requête
+                        pass
             except Exception as e:
-                mettre_a_jour_interface(f">_ ERREUR SCRIPT : {str(e)[:15]}", "red")
+                logging.error(f"[SYS_EDTEAM] Erreur transmission BGS : {e}")
 
         threading.Thread(target=process_bgs_complet).start()
