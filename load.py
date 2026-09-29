@@ -20,7 +20,7 @@ except ImportError:
     config = None
 
 plugin_name = "SYS.EDTEAM"
-PLUGIN_VERSION = "2.2"
+PLUGIN_VERSION = "2.3"
 
 SUPABASE_URL = "https://oailvdigfdoyfcydmabb.supabase.co"
 SUPABASE_KEY = "sb_publishable_AASqgRggHdIGttZHPGaWkA_VqrhuYNg"
@@ -347,9 +347,8 @@ def heartbeat_loop():
     global dernier_solde_vaisseau
     while True:
         try:
-            timestamp = str(int(time.time()))
-            maj_generique_global("HEARTBEAT", "SYS_CORE", timestamp, "STATUS")
-            
+            # Plus de HEARTBEAT : la presence n'est plus affichee cote site (economie d'Egress).
+            # La boucle ne fait plus que surveiller le solde (lecture fichier local, ecriture seulement si change).
             jdir = trouver_journal_dir()
             if jdir and os.path.exists(os.path.join(jdir, 'Status.json')):
                 with open(os.path.join(jdir, 'Status.json'), 'r', encoding='utf-8') as f:
