@@ -20,7 +20,7 @@ except ImportError:
     config = None
 
 plugin_name = "SYS.EDTEAM"
-PLUGIN_VERSION = "2.3"
+PLUGIN_VERSION = "2.4"
 
 SUPABASE_URL = "https://oailvdigfdoyfcydmabb.supabase.co"
 SUPABASE_KEY = "sb_publishable_AASqgRggHdIGttZHPGaWkA_VqrhuYNg"
@@ -77,11 +77,15 @@ def lire_cle():
     return ""
 
 def sauvegarder_cle(cle):
+    global cached_user_id, invalid_api_key
     try:
         chemin = os.path.join(os.path.dirname(os.path.abspath(__file__)), "edteam_key.txt")
         with open(chemin, 'w') as f:
             f.write(cle.strip())
     except: pass
+    # Nouvelle cle saisie : on repart de zero (sinon une cle refusee bloquait le plugin jusqu'au prochain redemarrage d'EDMC)
+    cached_user_id = None
+    invalid_api_key = False
 
 def get_headers():
     cle = lire_cle()
@@ -282,6 +286,130 @@ def maj_powerplay(puissance, rang, merites_cycle, merites_total):
             requests.post(f"{SUPABASE_URL}/rest/v1/radar_commercial", headers=get_headers(), json=payload, timeout=5)
     except: pass
 
+# ==========================================
+# POWERPLAY : RELEVE DIRECT (v2.4)
+# Le jeu ecrit PowerplayMerits a chaque gain (TotalMerits). On garde le dernier total en memoire et on l'envoie
+# en UNE requete (fonction serveur pp_releve : aucune lecture, aucune ligne radar), au plus toutes les 5 minutes.
+# Au demarrage, on relit les journaux recents pour rattraper ce qui a ete joue sans EDMC, cycle par cycle.
+# ==========================================
+PP_INTERVALLE_ENVOI = 300
+pp_etat = {'puissance': None, 'rang': 0, 'total': 0, 'a_envoyer': False, 'dernier_envoi': 0, 'connu': False}
+pp_historique_attente = []
+pp_rpc_absente = False
+pp_verrou = threading.Lock()
+
+def pp_cloture_cycle(dt):
+    """Jeudi (UTC) qui cloture le cycle Powerplay contenant dt (le cycle change le jeudi 07:00 UTC). Meme regle que cloture_cycle_pp() en base."""
+    decale = (dt - timedelta(hours=7)).date()
+    return decale + timedelta(days=((3 - decale.weekday()) % 7) or 7)
+
+def pp_enregistrer(puissance, rang=None, total=None):
+    """Memorise le dernier etat Powerplay vu dans le journal. L'envoi se fait plus tard, jamais a chaque evenement."""
+    with pp_verrou:
+        nouveau = (puissance,
+                   pp_etat['rang'] if rang is None else rang,
+                   pp_etat['total'] if total is None else total)
+        if not pp_etat['connu'] or nouveau != (pp_etat['puissance'], pp_etat['rang'], pp_etat['total']):
+            pp_etat['puissance'], pp_etat['rang'], pp_etat['total'] = nouveau
+            pp_etat['a_envoyer'] = True
+        pp_etat['connu'] = True
+
+def pp_envoyer(force=False):
+    """Envoie l'etat Powerplay (et l'historique en attente) si necessaire. Limite : 1 envoi par PP_INTERVALLE_ENVOI, sauf force."""
+    global pp_historique_attente, pp_rpc_absente
+    with pp_verrou:
+        if not pp_etat['connu']: return
+        if not pp_etat['a_envoyer'] and not pp_historique_attente: return
+        if not force and time.time() - pp_etat['dernier_envoi'] < PP_INTERVALLE_ENVOI: return
+        etat = dict(pp_etat)
+        historique = pp_historique_attente
+        pp_historique_attente = []
+        pp_etat['a_envoyer'] = False
+        pp_etat['dernier_envoi'] = time.time()
+
+    def _rearmer():
+        global pp_historique_attente
+        with pp_verrou:
+            pp_etat['a_envoyer'] = True
+            if historique: pp_historique_attente = historique + pp_historique_attente
+
+    if not get_user_id():
+        _rearmer()
+        return
+
+    if not pp_rpc_absente:
+        try:
+            res = requests.post(
+                f"{SUPABASE_URL}/rest/v1/rpc/pp_releve",
+                headers=get_headers(),
+                json={"p_puissance": etat['puissance'] or '', "p_rang": int(etat['rang'] or 0),
+                      "p_total": int(etat['total'] or 0), "p_historique": historique},
+                timeout=8
+            )
+            if res.status_code in (200, 201, 204): return
+            if res.status_code == 404:
+                pp_rpc_absente = True   # fonction pas encore creee en base : repli sur l'ancienne voie (v2.3)
+            else:
+                _rearmer()
+                return
+        except:
+            _rearmer()
+            return
+
+    # Repli v2.3 (fonction serveur absente)
+    if etat['puissance']:
+        maj_powerplay(etat['puissance'], etat['rang'], etat['total'], etat['total'])
+    else:
+        maj_powerplay(None, 0, 0, 0)
+
+def pp_scanner_journaux(jours=21):
+    """Relit les journaux recents : rattrape les merites gagnes sans EDMC (dernier total de chaque cycle, horodate)."""
+    global pp_historique_attente
+    try:
+        jdir = trouver_journal_dir()
+        if not jdir or not os.path.isdir(jdir): return
+        limite = time.time() - jours * 86400
+        fichiers = sorted(f for f in os.listdir(jdir)
+                          if f.startswith('Journal.') and f.endswith('.log')
+                          and os.path.getmtime(os.path.join(jdir, f)) >= limite)
+        nom, rang, total = None, 0, None
+        par_cycle = {}
+        for nom_fichier in fichiers:
+            with open(os.path.join(jdir, nom_fichier), 'r', encoding='utf-8', errors='ignore') as f:
+                for ligne in f:
+                    if '"event":"Powerplay' not in ligne: continue
+                    try: e = json.loads(ligne)
+                    except: continue
+                    ev = e.get('event')
+                    if ev == 'Powerplay':
+                        nom, rang, total = e.get('Power'), e.get('Rank', rang), e.get('Merits')
+                    elif ev == 'PowerplayMerits':
+                        nom, total = e.get('Power', nom), e.get('TotalMerits')
+                    elif ev == 'PowerplayRank':
+                        rang = e.get('Rank', rang)
+                        continue
+                    elif ev == 'PowerplayLeave':
+                        nom, rang, total = None, 0, None
+                        continue
+                    elif ev == 'PowerplayDefect':
+                        nom, rang, total = e.get('NewPower'), 0, 0
+                        continue
+                    else:
+                        continue
+                    if nom and total is not None:
+                        try: dt = datetime.strptime(e.get('timestamp', ''), "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+                        except: continue
+                        par_cycle[pp_cloture_cycle(dt)] = {"ts": e.get('timestamp'), "puissance": nom, "rang": int(rang or 0), "total": int(total)}
+        if not nom or total is None: return
+
+        with pp_verrou:
+            pp_historique_attente = list(par_cycle.values())
+        if not pp_etat['connu']:   # un evenement en direct est plus recent que la relecture : il prime
+            pp_enregistrer(nom, int(rang or 0), int(total))
+        pp_envoyer(force=True)
+    except Exception as e:
+        logging.error(f"[SYS_EDTEAM] Erreur relecture Powerplay : {e}")
+
 def notifier_journal_activite(type_act, details_txt, couleur_txt="#00F0FF"):
     """Injection d'une brève marquante dans le QG (0 octet d'Egress via return=minimal)."""
     uid = get_user_id()
@@ -358,6 +486,8 @@ def heartbeat_loop():
                         maj_generique_global("SHIP_BALANCE", "FINANCE", "BANK", "FINANCE", val=nouveau_solde)
                         dernier_solde_vaisseau = nouveau_solde
         except: pass
+        try: pp_envoyer()   # merites Powerplay : envoi si du (au plus toutes les 5 min)
+        except: pass
         time.sleep(60)
 
 def check_for_updates():
@@ -398,7 +528,12 @@ def check_for_updates():
 def plugin_start3(plugin_dir):
     threading.Thread(target=heartbeat_loop, daemon=True).start()
     threading.Thread(target=check_for_updates, daemon=True).start()
+    threading.Thread(target=pp_scanner_journaux, daemon=True).start()
     return "SYS.EDTEAM"
+
+def plugin_stop():
+    try: pp_envoyer(force=True)
+    except: pass
 
 def plugin_app(parent):
     global status_label
@@ -540,16 +675,28 @@ def journal_entry(cmdr, is_beta, system, station, entry, state):
     # POWERPLAY 2.0
     # ==========================================
     elif event == 'Powerplay':
+        # 'Merits' = TOTAL des merites (pas ceux du cycle : le jeu n'envoie pas de compteur de cycle)
         power = entry.get('Power')
-        rank = entry.get('Rank', 0)
-        merits_cycle = entry.get('Merits', 0)
-        merits_total = entry.get('TotalMerits', merits_cycle)
         if power:
-            threading.Thread(target=maj_powerplay, args=(power, rank, merits_cycle, merits_total)).start()
+            pp_enregistrer(power, entry.get('Rank', 0), entry.get('Merits', 0))
+            threading.Thread(target=pp_envoyer, daemon=True).start()
+
+    elif event == 'PowerplayMerits':
+        # Gain de merites en direct : memorise seulement, la boucle de fond envoie au plus toutes les 5 minutes
+        if entry.get('Power') and entry.get('TotalMerits') is not None:
+            pp_enregistrer(entry.get('Power'), None, entry.get('TotalMerits'))
+
+    elif event == 'PowerplayRank':
+        if entry.get('Power') and entry.get('Rank') is not None:
+            pp_enregistrer(entry.get('Power'), entry.get('Rank'), None)
 
     elif event in ['PowerplayLeave', 'PowerplayDefect']:
         new_power = entry.get('NewPower') if event == 'PowerplayDefect' else None
-        threading.Thread(target=maj_powerplay, args=(new_power, 0, 0, 0)).start()
+        pp_enregistrer(new_power, 0, 0)
+        threading.Thread(target=pp_envoyer, kwargs={'force': True}, daemon=True).start()
+
+    elif event == 'Shutdown':
+        pp_envoyer(force=True)
 
     # ==========================================
     # FLEET CARRIER (solde)
