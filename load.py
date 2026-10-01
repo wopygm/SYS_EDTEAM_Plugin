@@ -6,6 +6,8 @@ import logging
 import time
 import math
 import json
+import re
+import hashlib
 import platform
 import threading
 import tkinter as tk
@@ -20,7 +22,7 @@ except ImportError:
     config = None
 
 plugin_name = "SYS.EDTEAM"
-PLUGIN_VERSION = "2.4"
+PLUGIN_VERSION = "2.5"
 
 SUPABASE_URL = "https://oailvdigfdoyfcydmabb.supabase.co"
 SUPABASE_KEY = "sb_publishable_AASqgRggHdIGttZHPGaWkA_VqrhuYNg"
@@ -410,6 +412,771 @@ def pp_scanner_journaux(jours=21):
     except Exception as e:
         logging.error(f"[SYS_EDTEAM] Erreur relecture Powerplay : {e}")
 
+# ==========================================
+# COLONISATION : chantiers, livraisons et systemes revendiques, releves automatiquement dans les journaux de jeu.
+# Un evenement est traite par col_traiter_evenement() (en direct comme a la relecture, aucun appel reseau) ;
+# l'envoi (col_envoyer) regroupe : UNE ligne par chantier et par envoi, au plus un envoi toutes les COL_INTERVALLE_ENVOI secondes.
+# Au premier lancement, tous les journaux sont relus une fois (historique) ; ensuite seulement ce qui date depuis le dernier envoi.
+# Le serveur (fonction col_releve, script SQL 21) ignore les pilotes sans escadron et les doublons.
+# ==========================================
+COL_INTERVALLE_ENVOI = 180
+COL_LOT_CHANTIERS = 40
+COL_LOT_SYSTEMES = 40
+COL_LOT_LIVRAISONS = 400
+COL_LOT_INSTALLATIONS = 100
+COL_MARQUEUR = 'col_marqueur.json'
+COL_ECHECS_MAX = 5
+
+col_verrou = threading.Lock()
+col_attente = {'chantiers': {}, 'systemes': {}, 'livraisons': [], 'installations': {}}
+col_stations = {}      # MarketID -> {'station', 'type', 'systeme', 'adresse'} (vu a l'amarrage)
+col_positions = {}     # SystemAddress -> {'nom', 'x', 'y', 'z'} (vu aux sauts)
+col_courant = {'adresse': None, 'nom': None}
+col_etat = {'dernier_envoi': 0, 'rpc_absente': False, 'dernier_ts': '', 'echecs': 0, 'inst_absente': False}
+col_faction = {'nom': None}   # faction de l'escadron (flag SquadronFaction:true vu aux sauts)
+col_inst_envoyees = set()     # MarketID d'installations deja envoyees pendant cette session
+
+def col_chemin(nom):
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), nom)
+
+def col_trace(msg):
+    """Diagnostic : n'ecrit QUE si un fichier col_debug.txt existe deja a cote de load.py (le creer vide pour activer). Sinon, sans effet."""
+    try:
+        if not os.path.exists(col_chemin('col_debug.txt')):
+            return
+        with open(col_chemin('col_debug.txt'), 'a', encoding='utf-8') as f:
+            f.write(datetime.now().strftime('%H:%M:%S') + ' ' + str(msg) + chr(10))
+    except Exception:
+        pass
+
+def col_nom_marchandise(nom_interne, localise):
+    if localise:
+        return str(localise)
+    n = str(nom_interne or '').strip('$;')
+    if n.lower().endswith('_name'):
+        n = n[:-5]
+    return n
+
+def col_maj_ts(ts):
+    if ts and str(ts) > col_etat['dernier_ts']:
+        col_etat['dernier_ts'] = str(ts)
+
+def col_traiter_evenement(entry):
+    """Traite UN evenement de journal. Ne fait aucun appel reseau."""
+    ev = entry.get('event')
+    ts = entry.get('timestamp')
+
+    if ev in ('FSDJump', 'Location', 'CarrierJump'):
+        adr = entry.get('SystemAddress')
+        nom = entry.get('StarSystem')
+        if adr and nom:
+            pos = entry.get('StarPos')
+            x = y = z = None
+            if isinstance(pos, (list, tuple)) and len(pos) == 3:
+                x, y, z = pos[0], pos[1], pos[2]
+            col_positions[adr] = {'nom': nom, 'x': x, 'y': y, 'z': z,
+                                  'faction': (entry.get('SystemFaction') or {}).get('Name'), 'faction_ts': ts}
+            col_courant['adresse'] = adr
+            col_courant['nom'] = nom
+        for f_ in (entry.get('Factions') or []):
+            if isinstance(f_, dict) and f_.get('SquadronFaction') is True and f_.get('Name'):
+                col_faction['nom'] = f_.get('Name')
+                break
+        return
+
+    if ev == 'Docked':
+        mid = entry.get('MarketID')
+        typ = entry.get('StationType') or ''
+        nom_st = entry.get('StationName') or ''
+        if mid and ('ConstructionDepot' in typ or 'ColonisationShip' in nom_st or 'Construction Site' in nom_st):
+            col_stations[mid] = {'station': nom_st, 'type': typ, 'systeme': entry.get('StarSystem'), 'adresse': entry.get('SystemAddress')}
+        elif (mid and col_faction['nom'] and typ != 'FleetCarrier' and not nom_st.startswith('$') and entry.get('SystemAddress')
+              and mid not in col_inst_envoyees and (entry.get('StationFaction') or {}).get('Name') == col_faction['nom']):
+            # Station terminee de la faction de l'escadron : simple CANDIDATE. Le serveur (col_installations, SQL 24) ne la retient que si le
+            # systeme est deja connu comme colonise (revendication ou chantier vu) ; les systemes BGS classiques sont jetes la-bas.
+            with col_verrou:
+                col_attente['installations'][mid] = {'market_id': mid, 'systeme_adresse': entry.get('SystemAddress'),
+                                                     'systeme_nom': entry.get('StarSystem'), 'nom': nom_st, 'type_station': typ, 'ts': ts,
+                                                     'faction': (col_positions.get(entry.get('SystemAddress')) or {}).get('faction'),
+                                                     'faction_ts': (col_positions.get(entry.get('SystemAddress')) or {}).get('faction_ts')}
+        return
+
+    if ev == 'ColonisationSystemClaim':
+        adr = entry.get('SystemAddress')
+        nom = entry.get('StarSystem')
+        if adr and nom:
+            p = col_positions.get(adr) or {}
+            with col_verrou:
+                col_attente['systemes'][adr] = {'adresse': adr, 'nom': nom, 'x': p.get('x'), 'y': p.get('y'), 'z': p.get('z'),
+                                                'revendique': True, 'revendique_le': ts}
+        col_maj_ts(ts)
+        return
+
+    if ev == 'ColonisationConstructionDepot':
+        mid = entry.get('MarketID')
+        if not mid:
+            return
+        st = col_stations.get(mid) or {}
+        adr = st.get('adresse') or col_courant['adresse']
+        nom_sys = st.get('systeme') or col_courant['nom']
+        march = []
+        for r in (entry.get('ResourcesRequired') or []):
+            march.append({'nom': r.get('Name'),
+                          'nom_fr': col_nom_marchandise(r.get('Name'), r.get('Name_Localised')),
+                          'requis': int(r.get('RequiredAmount') or 0),
+                          'livre': int(r.get('ProvidedAmount') or 0),
+                          'paiement': int(r.get('Payment') or 0)})
+        chantier = {'market_id': mid, 'systeme_adresse': adr, 'systeme_nom': nom_sys,
+                    'station_nom': st.get('station'), 'type_station': st.get('type'),
+                    'progression': float(entry.get('ConstructionProgress') or 0),
+                    'complet': bool(entry.get('ConstructionComplete')), 'echec': bool(entry.get('ConstructionFailed')),
+                    'ts': ts, 'marchandises': march}
+        with col_verrou:
+            col_attente['chantiers'][mid] = chantier          # le plus recent remplace le precedent
+            if adr and nom_sys and adr not in col_attente['systemes']:
+                p = col_positions.get(adr) or {}
+                col_attente['systemes'][adr] = {'adresse': adr, 'nom': nom_sys, 'x': p.get('x'), 'y': p.get('y'), 'z': p.get('z'),
+                                                'revendique': False}
+        col_maj_ts(ts)
+        return
+
+    if ev == 'ColonisationContribution':
+        mid = entry.get('MarketID')
+        if not mid:
+            return
+        lignes = []
+        for c in (entry.get('Contributions') or []):
+            t = int(c.get('Amount') or 0)
+            if t > 0:
+                lignes.append({'market_id': mid, 'marchandise': c.get('Name'),
+                               'marchandise_nom': col_nom_marchandise(c.get('Name'), c.get('Name_Localised')),
+                               'tonnes': t, 'ts': ts})
+        if lignes:
+            with col_verrou:
+                col_attente['livraisons'].extend(lignes)
+        col_maj_ts(ts)
+        return
+
+def col_lire_marqueur():
+    try:
+        with open(col_chemin(COL_MARQUEUR), 'r', encoding='utf-8') as f:
+            return json.load(f).get('dernier_ts') or ''
+    except Exception:
+        return ''
+
+def col_ecrire_marqueur(ts):
+    if not ts:
+        return
+    try:
+        with open(col_chemin(COL_MARQUEUR), 'w', encoding='utf-8') as f:
+            json.dump({'dernier_ts': ts}, f)
+    except Exception:
+        pass
+
+def col_envoyer_installations(installations):
+    """Second appel (fonction col_installations, SQL 24) : stations terminees candidates. Remises en attente si l'envoi echoue."""
+    if not installations or col_etat['inst_absente']:
+        return
+    def _rearmer_i(lst):
+        with col_verrou:
+            for x in lst:
+                if x['market_id'] not in col_inst_envoyees and x['market_id'] not in col_attente['installations']:
+                    col_attente['installations'][x['market_id']] = x
+    if not get_user_id():
+        _rearmer_i(installations)
+        return
+    i_i = 0
+    try:
+        while i_i < len(installations):
+            lot_i = installations[i_i:i_i + COL_LOT_INSTALLATIONS]
+            res = requests.post(
+                f"{SUPABASE_URL}/rest/v1/rpc/col_installations",
+                headers=get_headers(),
+                json={'p_installations': lot_i},
+                timeout=20
+            )
+            col_trace('col_installations : %d stations -> HTTP %s %s' % (len(lot_i), res.status_code, (res.text or '')[:160]))
+            if res.status_code in (200, 201, 204):
+                for x in lot_i:
+                    col_inst_envoyees.add(x['market_id'])
+                i_i += len(lot_i)
+                continue
+            if res.status_code == 404:
+                col_etat['inst_absente'] = True      # fonction pas encore creee en base : on ne reessaie pas
+                return
+            raise RuntimeError('HTTP ' + str(res.status_code))
+    except Exception as e:
+        col_trace('installations : envoi en echec : %r' % (e,))
+        _rearmer_i(installations[i_i:])
+
+def col_envoyer(force=False):
+    """Envoie ce qui est en attente, par lots. Au plus un envoi toutes les COL_INTERVALLE_ENVOI secondes, sauf force."""
+    if col_etat['rpc_absente']:
+        return
+    with col_verrou:
+        if not (col_attente['chantiers'] or col_attente['systemes'] or col_attente['livraisons'] or col_attente['installations']):
+            return
+        if not force and time.time() - col_etat['dernier_envoi'] < COL_INTERVALLE_ENVOI:
+            return
+        chantiers = list(col_attente['chantiers'].values())
+        systemes = list(col_attente['systemes'].values())
+        livraisons = list(col_attente['livraisons'])
+        installations = list(col_attente['installations'].values())
+        col_attente['installations'] = {}
+        col_attente['chantiers'] = {}
+        col_attente['systemes'] = {}
+        col_attente['livraisons'] = []
+        col_etat['dernier_envoi'] = time.time()
+
+    col_envoyer_installations(installations)
+
+    # positions connues depuis (un systeme peut etre revendique avant qu'on y saute)
+    for s_ in systemes:
+        if s_.get('x') is None:
+            p_ = col_positions.get(s_['adresse'])
+            if p_ and p_.get('x') is not None:
+                s_['x'] = p_.get('x')
+                s_['y'] = p_.get('y')
+                s_['z'] = p_.get('z')
+
+    # faction qui controle le systeme (la plus recente vue aux sauts)
+    for s_ in systemes:
+        p_ = col_positions.get(s_['adresse']) or {}
+        if p_.get('faction'):
+            s_['faction'] = p_.get('faction')
+            s_['faction_ts'] = p_.get('faction_ts')
+
+    def _rearmer(ch, sy, li):
+        col_etat['echecs'] += 1
+        if col_etat['echecs'] >= COL_ECHECS_MAX:
+            col_trace('abandon apres %d echecs : %d chantiers, %d systemes, %d livraisons non envoyes' % (col_etat['echecs'], len(ch), len(sy), len(li)))
+            col_etat['echecs'] = 0
+            return
+        with col_verrou:
+            for c in ch:
+                if c['market_id'] not in col_attente['chantiers']:     # un releve plus recent est peut-etre deja arrive
+                    col_attente['chantiers'][c['market_id']] = c
+            for s in sy:
+                if s['adresse'] not in col_attente['systemes']:
+                    col_attente['systemes'][s['adresse']] = s
+            col_attente['livraisons'] = li + col_attente['livraisons']
+
+    if not get_user_id():
+        col_trace('envoi differe : get_user_id() vide (cle inconnue ou reseau)')
+        _rearmer(chantiers, systemes, livraisons)
+        return
+
+    i_c = 0
+    i_s = 0
+    i_l = 0
+    try:
+        while i_c < len(chantiers) or i_s < len(systemes) or i_l < len(livraisons):
+            lot_c = chantiers[i_c:i_c + COL_LOT_CHANTIERS]
+            lot_s = systemes[i_s:i_s + COL_LOT_SYSTEMES]
+            lot_l = livraisons[i_l:i_l + COL_LOT_LIVRAISONS]
+            res = requests.post(
+                f"{SUPABASE_URL}/rest/v1/rpc/col_releve",
+                headers=get_headers(),
+                json={'p_systemes': lot_s, 'p_chantiers': lot_c, 'p_livraisons': lot_l},
+                timeout=20
+            )
+            col_trace('col_releve : %d chantiers, %d systemes, %d livraisons -> HTTP %s %s' % (len(lot_c), len(lot_s), len(lot_l), res.status_code, (res.text or '')[:160]))
+            if res.status_code in (200, 201, 204):
+                i_c += len(lot_c)
+                i_s += len(lot_s)
+                i_l += len(lot_l)
+                continue
+            if res.status_code == 404:
+                col_etat['rpc_absente'] = True      # fonction pas encore creee en base : on ne reessaie pas
+                return
+            raise RuntimeError('HTTP ' + str(res.status_code))
+    except Exception as e:
+        col_trace('envoi en echec : %r' % (e,))
+        _rearmer(chantiers[i_c:], systemes[i_s:], livraisons[i_l:])
+        return
+    col_etat['echecs'] = 0
+
+def col_scanner_journaux():
+    """Relit les journaux : tout l'historique la premiere fois, ensuite seulement depuis le dernier envoi (moins 2 jours)."""
+    try:
+        debut_scan = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+        jdir = trouver_journal_dir()
+        col_trace('relecture : dossier des journaux = %s' % jdir)
+        if not jdir or not os.path.isdir(jdir):
+            return
+        marqueur = col_lire_marqueur()
+        limite = None
+        if marqueur:
+            try:
+                limite = datetime.strptime(marqueur, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc).timestamp() - 2 * 86400
+            except Exception:
+                limite = None
+        fichiers = sorted(f for f in os.listdir(jdir)
+                          if f.startswith('Journal.') and f.endswith('.log')
+                          and (limite is None or os.path.getmtime(os.path.join(jdir, f)) >= limite))
+        mots = ('"event":"Coloni', '"event":"Docked"', '"event":"FSDJump"', '"event":"Location"', '"event":"CarrierJump"')
+        nb = 0
+        for nom_fichier in fichiers:
+            with open(os.path.join(jdir, nom_fichier), 'r', encoding='utf-8', errors='ignore') as f:
+                for ligne in f:
+                    if not any(m in ligne for m in mots):
+                        continue
+                    try:
+                        e = json.loads(ligne)
+                    except Exception:
+                        continue
+                    col_traiter_evenement(e)
+                    nb += 1
+        with col_verrou:
+            n_c = len(col_attente['chantiers'])
+            n_s = len(col_attente['systemes'])
+            n_l = len(col_attente['livraisons'])
+        col_trace('relecture : %d fichiers, %d evenements utiles, en attente : %d chantiers, %d systemes, %d livraisons (marqueur = %s)' % (len(fichiers), nb, n_c, n_s, n_l, marqueur or 'aucun'))
+        col_envoyer(force=True)
+        with col_verrou:
+            reste = len(col_attente['chantiers']) + len(col_attente['systemes']) + len(col_attente['livraisons'])
+        if reste == 0 and col_etat['echecs'] == 0 and not col_etat['rpc_absente']:
+            col_ecrire_marqueur(debut_scan)      # relecture complete et envoyee : la prochaine ne remontera que depuis ce moment (moins 2 jours)
+            col_trace('relecture terminee, marqueur = %s' % debut_scan)
+    except Exception as e:
+        col_trace('relecture : EXCEPTION %r' % (e,))
+
+# ==========================================
+# BUDGET PERSONNEL : revenus et charges releves dans les journaux de jeu (script SQL 23).
+# Chaque evenement d'argent est classe (bud_classer), ajoute aux totaux du CYCLE (jeudi 07:00 UTC) et, pour les 8 derniers cycles,
+# au livre de compte. Le plugin envoie les totaux COMPLETS des cycles modifies (le serveur les remplace) et les nouvelles lignes,
+# au plus toutes les 5 minutes. L'etat est garde dans budget_etat.json (a cote de load.py) : un redemarrage ne compte jamais deux fois
+# un evenement (filtre sur l'horodatage du dernier evenement compte). Tout reste PRIVE : le serveur ne rend ces lignes qu'a leur pilote.
+# Le solde suivi est recale a chaque lancement du jeu (LoadGame) : la difference est enregistree comme "ecart", jamais cachee.
+# ==========================================
+BUD_INTERVALLE_ENVOI = 300
+BUD_LOT_LIGNES = 400
+BUD_LOT_CYCLES = 120
+BUD_LOTS_PAR_PASSE = 10
+BUD_MAX_LIGNES = 3000
+BUD_FICHIER = 'budget_etat.json'
+BUD_REVENUS = ('commerce', 'missions', 'primes', 'exploration', 'minage', 'autres_revenus')
+BUD_EVENEMENTS_ARGENT = frozenset((
+    'MissionCompleted', 'RedeemVoucher', 'SellExplorationData', 'MultiSellExplorationData', 'SellOrganicData', 'MarketSell',
+    'MarketBuy', 'SearchAndRescue', 'CommunityGoalReward', 'PowerplaySalary', 'ModuleSell', 'ModuleSellRemote', 'ShipyardSell',
+    'SellDrones', 'SellMicroResources', 'ModuleBuy', 'ModuleBuyAndStore', 'ShipyardBuy', 'RefuelAll', 'RefuelPartial', 'Repair',
+    'RepairAll', 'RestockVehicle', 'BuyAmmo', 'BuyDrones', 'Resurrect', 'PayFines', 'PayLegacyFines', 'PayBounties',
+    'FetchRemoteModule', 'ShipyardTransfer', 'BookTaxi', 'BookDropship', 'NpcCrewPaidWage', 'CrewHire', 'BuyExplorationData',
+    'BuyTradeData', 'BuyMicroResources', 'BuyWeapon', 'BuySuit', 'UpgradeSuit', 'UpgradeWeapon', 'SellWeapon', 'SellSuit',
+    'MissionFailed', 'PowerplayFastTrack', 'ModuleRetrieve', 'ModuleStore',
+    'CarrierBankTransfer', 'CarrierBuy', 'LoadGame'))
+BUD_EVENEMENTS_CONTEXTE = frozenset(('Location', 'FSDJump', 'CarrierJump', 'Docked', 'Undocked'))
+bud_re_journal = re.compile('"event":"(' + '|'.join(sorted(BUD_EVENEMENTS_ARGENT | BUD_EVENEMENTS_CONTEXTE)) + ')"')
+
+bud_verrou = threading.RLock()
+bud_etat = {'dernier_ts': '', 'refs': [], 'solde': None, 'cycles': {}, 'sales': [], 'lignes': [], 'lu_jusqua': ''}
+bud_ctx = {'systeme': '', 'station': ''}
+bud_file = []          # evenements vus en direct pendant la relecture des journaux
+bud_flags = {'pret': False, 'absente': False, 'dernier_envoi': 0, 'dernier_sauvetage': 0, 'modifie': False, 'echecs': 0}
+
+def bud_chemin():
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), BUD_FICHIER)
+
+def bud_trace(msg):
+    """Diagnostic : n'ecrit QUE si un fichier bud_debug.txt existe deja a cote de load.py (le creer vide pour activer)."""
+    try:
+        chemin = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'bud_debug.txt')
+        if not os.path.exists(chemin):
+            return
+        with open(chemin, 'a', encoding='utf-8') as f:
+            f.write(datetime.now().strftime('%H:%M:%S') + ' ' + str(msg) + chr(10))
+    except Exception:
+        pass
+
+def bud_semaine(ts):
+    """Jeudi (date ISO) qui cloture le cycle contenant cet instant UTC : meme regle que cloture_cycle_pp cote serveur."""
+    dt = datetime.strptime(str(ts)[:19], '%Y-%m-%dT%H:%M:%S') - timedelta(hours=7)
+    d = dt.date()
+    delta = (3 - d.weekday()) % 7
+    if delta == 0:
+        delta = 7
+    return (d + timedelta(days=delta)).isoformat()
+
+def bud_fenetre_debut():
+    """Debut de la fenetre du livre : debut du cycle courant moins 7 cycles (8 cycles au total), comme budget_fenetre_debut()."""
+    cur = datetime.strptime(bud_semaine(datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')), '%Y-%m-%d')
+    return (cur - timedelta(days=56) + timedelta(hours=7)).strftime('%Y-%m-%dT%H:%M:%SZ')
+
+def bud_charger_etat():
+    try:
+        with open(bud_chemin(), 'r', encoding='utf-8') as f:
+            d = json.load(f)
+        with bud_verrou:
+            for cle in ('dernier_ts', 'lu_jusqua'):
+                bud_etat[cle] = str(d.get(cle) or '')
+            bud_etat['refs'] = list(d.get('refs') or [])
+            bud_etat['solde'] = d.get('solde')
+            bud_etat['cycles'] = dict(d.get('cycles') or {})
+            bud_etat['sales'] = list(d.get('sales') or [])
+            bud_etat['lignes'] = list(d.get('lignes') or [])
+    except Exception:
+        pass
+
+def bud_sauver_etat():
+    """Ecriture atomique de l'etat (totaux, horodatage du dernier evenement compte, lignes en attente)."""
+    try:
+        with bud_verrou:
+            donnees = json.dumps(bud_etat)
+            bud_flags['modifie'] = False
+            bud_flags['dernier_sauvetage'] = time.time()
+        tmp = bud_chemin() + '.tmp'
+        with open(tmp, 'w', encoding='utf-8') as f:
+            f.write(donnees)
+        os.replace(tmp, bud_chemin())
+    except Exception as e:
+        bud_trace('sauvegarde impossible : %r' % (e,))
+
+def _bn(v):
+    try:
+        return int(v)
+    except Exception:
+        return 0
+
+def bud_classer(e):
+    """Un evenement du journal -> liste de (categorie, montant POSITIF, libelle). Liste vide si aucun mouvement d'argent."""
+    ev = e.get('event')
+    out = []
+    def add(cat, montant, lib):
+        m = _bn(montant)
+        if m > 0:
+            out.append((cat, m, str(lib)[:120]))
+    nom_march = e.get('Type_Localised') or e.get('Type') or ''
+    if ev == 'MissionCompleted':
+        nom = e.get('LocalisedName') or e.get('Name') or ''
+        add('missions', e.get('Reward'), 'Mission : ' + str(nom))
+        add('autres_charges', e.get('Donated'), 'Don (mission) : ' + str(nom))
+    elif ev == 'RedeemVoucher':
+        typ = str(e.get('Type') or '').lower()
+        if typ == 'bounty':
+            add('primes', e.get('Amount'), 'Encaissement de primes')
+        elif typ == 'combatbond':
+            add('primes', e.get('Amount'), "Encaissement de bons de combat")
+        else:
+            add('autres_revenus', e.get('Amount'), 'Encaissement de bons : ' + typ)
+    elif ev in ('SellExplorationData', 'MultiSellExplorationData'):
+        total = e.get('TotalEarnings')
+        if total is None:
+            total = _bn(e.get('BaseValue')) + _bn(e.get('Bonus'))
+        add('exploration', total, "Vente de données d'exploration")
+    elif ev == 'SellOrganicData':
+        total = e.get('TotalEarnings')
+        if total is None:
+            total = sum(_bn(b.get('Value')) + _bn(b.get('Bonus')) for b in (e.get('BioData') or []) if isinstance(b, dict))
+        add('exploration', total, 'Vente de données organiques')
+    elif ev == 'MarketSell':
+        cat = 'minage' if _bn(e.get('AvgPricePaid')) == 0 else 'commerce'
+        add(cat, e.get('TotalSale'), 'Vente ' + str(nom_march) + ' x' + str(_bn(e.get('Count'))))
+    elif ev == 'MarketBuy':
+        add('achats', e.get('TotalCost'), 'Achat ' + str(nom_march) + ' x' + str(_bn(e.get('Count'))))
+    elif ev == 'SearchAndRescue':
+        add('autres_revenus', e.get('Reward'), 'Sauvetage : ' + str(e.get('Name_Localised') or e.get('Name') or ''))
+    elif ev == 'CommunityGoalReward':
+        add('autres_revenus', e.get('Reward'), 'Objectif communautaire : ' + str(e.get('Name') or ''))
+    elif ev == 'PowerplaySalary':
+        add('autres_revenus', e.get('Salary') or e.get('Amount'), 'Salaire Powerplay')
+    elif ev in ('ModuleSell', 'ModuleSellRemote'):
+        add('autres_revenus', e.get('SellPrice'), 'Revente de module')
+    elif ev == 'ShipyardSell':
+        add('autres_revenus', e.get('ShipPrice'), 'Revente de vaisseau')
+    elif ev == 'SellDrones':
+        add('autres_revenus', e.get('TotalSale'), 'Vente de drones')
+    elif ev == 'SellMicroResources':
+        add('autres_revenus', e.get('Price'), 'Vente de micro-ressources')
+    elif ev in ('SellWeapon', 'SellSuit'):
+        add('autres_revenus', e.get('Price'), 'Revente d\'équipement à pied')
+    elif ev == 'ModuleBuy':
+        add('modules', e.get('BuyPrice'), 'Achat de module')
+        add('autres_revenus', e.get('SellPrice'), "Revente de l'ancien module")
+    elif ev == 'ModuleBuyAndStore':
+        add('modules', e.get('BuyPrice'), 'Achat de module (stockage)')
+    elif ev == 'ShipyardBuy':
+        add('modules', e.get('ShipPrice'), 'Achat de vaisseau : ' + str(e.get('ShipType_Localised') or e.get('ShipType') or ''))
+        add('autres_revenus', e.get('SellPrice'), "Revente de l'ancien vaisseau")
+    elif ev in ('BuyWeapon', 'BuySuit'):
+        add('modules', e.get('Price'), "Achat d'équipement à pied : " + str(e.get('Name_Localised') or e.get('Name') or ''))
+    elif ev in ('UpgradeSuit', 'UpgradeWeapon'):
+        add('modules', e.get('Cost'), "Amélioration d'équipement à pied")
+    elif ev == 'ModuleStore':
+        add('modules', e.get('Cost'), 'Stockage de module')
+    elif ev in ('RefuelAll', 'RefuelPartial'):
+        add('carburant', e.get('Cost'), 'Ravitaillement')
+    elif ev in ('Repair', 'RepairAll'):
+        add('reparations', e.get('Cost'), 'Réparation')
+    elif ev in ('RestockVehicle', 'BuyAmmo'):
+        add('munitions', e.get('Cost'), 'Munitions et recharges')
+    elif ev == 'BuyDrones':
+        add('munitions', e.get('TotalCost'), 'Achat de drones')
+    elif ev == 'Resurrect':
+        add('assurance', e.get('Cost'), 'Rachat après destruction')
+    elif ev in ('PayFines', 'PayLegacyFines'):
+        add('amendes', e.get('Amount'), "Paiement d'amendes")
+    elif ev == 'PayBounties':
+        add('amendes', e.get('Amount'), 'Paiement de primes sur votre tête')
+    elif ev == 'MissionFailed':
+        add('amendes', e.get('Fine'), 'Pénalité de mission échouée')
+    elif ev == 'FetchRemoteModule':
+        add('transferts', e.get('TransferCost'), 'Transfert de module')
+    elif ev == 'ShipyardTransfer':
+        add('transferts', e.get('TransferPrice'), 'Transfert de vaisseau')
+    elif ev == 'ModuleRetrieve':
+        add('transferts', e.get('Cost'), 'Récupération de module')
+    elif ev in ('BookTaxi', 'BookDropship'):
+        add('transferts', e.get('Cost'), 'Taxi' if ev == 'BookTaxi' else 'Transport en navette')
+    elif ev == 'NpcCrewPaidWage':
+        add('autres_charges', e.get('Amount'), "Salaire d'équipage")
+    elif ev == 'CrewHire':
+        add('autres_charges', e.get('Cost'), "Embauche d'équipage")
+    elif ev in ('BuyExplorationData', 'BuyTradeData'):
+        add('autres_charges', e.get('Cost'), 'Achat de données')
+    elif ev == 'BuyMicroResources':
+        add('autres_charges', e.get('Price'), 'Achat de micro-ressources')
+    elif ev == 'PowerplayFastTrack':
+        add('autres_charges', e.get('Cost'), 'Powerplay : accélération')
+    return out
+
+def bud_lieu():
+    s, st = bud_ctx['systeme'], bud_ctx['station']
+    return (st + ' / ' + s if st and s else (s or st or ''))[:120]
+
+def bud_ajouter(sem, ts, cat, montant, lib, ref):
+    """Ajoute un mouvement au cycle (et au livre si dans la fenetre). montant POSITIF sauf pour 'ecart' (signe). Appel sous bud_verrou."""
+    c = bud_etat['cycles'].setdefault(sem, {'t': {}, 'debut': None, 'fin': None})
+    revenu = cat in BUD_REVENUS
+    signe = montant if (cat == 'ecart' or revenu) else -montant
+    t = c['t'].setdefault(cat, {'m': 0, 'n': 0})
+    t['m'] += montant
+    t['n'] += 1
+    avant = bud_etat['solde']
+    if avant is not None:
+        if c['debut'] is None:
+            c['debut'] = avant
+        bud_etat['solde'] = avant + signe
+        c['fin'] = bud_etat['solde']
+    if sem not in bud_etat['sales']:
+        bud_etat['sales'].append(sem)
+    if ts >= bud_fenetre_debut():
+        bud_etat['lignes'].append({'ts': ts, 'k': cat, 'm': signe, 'l': lib, 'lieu': bud_lieu(), 'ref': ref})
+        if len(bud_etat['lignes']) > BUD_MAX_LIGNES:
+            del bud_etat['lignes'][:len(bud_etat['lignes']) - BUD_MAX_LIGNES]
+    bud_flags['modifie'] = True
+
+def bud_deja_compte(ts, ref):
+    """Vrai si cet evenement a deja ete compte ; sinon l'enregistre comme dernier evenement compte. Appel sous bud_verrou."""
+    dernier = bud_etat['dernier_ts']
+    if ts < dernier:
+        return True
+    if ts == dernier:
+        if ref in bud_etat['refs']:
+            return True
+        bud_etat['refs'].append(ref)
+        return False
+    bud_etat['dernier_ts'] = ts
+    bud_etat['refs'] = [ref]
+    return False
+
+def bud_appliquer(entry):
+    """Traite UN evenement (en direct ou a la relecture), dans l'ordre chronologique. Appel sous bud_verrou."""
+    ev = entry.get('event')
+    ts = str(entry.get('timestamp') or '')
+    if ev in ('Location', 'FSDJump', 'CarrierJump'):
+        bud_ctx['systeme'] = str(entry.get('StarSystem') or '')
+        bud_ctx['station'] = ''
+        return
+    if ev == 'Docked':
+        bud_ctx['systeme'] = str(entry.get('StarSystem') or bud_ctx['systeme'])
+        bud_ctx['station'] = str(entry.get('StationName') or '')
+        return
+    if ev == 'Undocked':
+        bud_ctx['station'] = ''
+        return
+    if ev not in BUD_EVENEMENTS_ARGENT or len(ts) < 19:
+        return
+    ref = hashlib.md5(json.dumps(entry, sort_keys=True).encode('utf-8')).hexdigest()[:12]
+    sem = bud_semaine(ts)
+
+    if ev == 'LoadGame':
+        credits = entry.get('Credits')
+        if credits is None:
+            return
+        credits = _bn(credits)
+        if bud_deja_compte(ts, ref):
+            return
+        if bud_etat['solde'] is None:
+            c = bud_etat['cycles'].setdefault(sem, {'t': {}, 'debut': None, 'fin': None})
+            if c['debut'] is None:
+                c['debut'] = credits
+            c['fin'] = credits
+            bud_etat['solde'] = credits
+            if sem not in bud_etat['sales']:
+                bud_etat['sales'].append(sem)
+            bud_flags['modifie'] = True
+        else:
+            ecart = credits - _bn(bud_etat['solde'])
+            if ecart != 0:
+                bud_ajouter(sem, ts, 'ecart', ecart, 'Écart constaté au lancement du jeu (mouvements non relevés)', ref)
+            bud_etat['solde'] = credits
+        return
+
+    if ev in ('CarrierBankTransfer', 'CarrierBuy'):
+        # Mouvement entre le compte du pilote et sa porte-flotte (hors budget pour l'instant) : on suit seulement le solde.
+        if bud_deja_compte(ts, ref):
+            return
+        if ev == 'CarrierBankTransfer' and entry.get('PlayerBalance') is not None:
+            bud_etat['solde'] = _bn(entry.get('PlayerBalance'))      # le journal donne le solde exact apres le virement
+            bud_flags['modifie'] = True
+        elif bud_etat['solde'] is not None:
+            if ev == 'CarrierBankTransfer':
+                bud_etat['solde'] = _bn(bud_etat['solde']) - _bn(entry.get('Deposit')) + _bn(entry.get('Withdraw'))
+            else:
+                bud_etat['solde'] = _bn(bud_etat['solde']) - _bn(entry.get('Price'))
+            bud_flags['modifie'] = True
+        return
+
+    mouvements = bud_classer(entry)
+    if not mouvements or bud_deja_compte(ts, ref):
+        return
+    for cat, montant, lib in mouvements:
+        bud_ajouter(sem, ts, cat, montant, lib, ref)
+
+def bud_traiter_evenement(entry):
+    """Appelee pour chaque evenement en direct. Pendant la relecture des journaux, les evenements attendent dans bud_file."""
+    ev = entry.get('event')
+    if ev not in BUD_EVENEMENTS_ARGENT and ev not in BUD_EVENEMENTS_CONTEXTE:
+        return
+    with bud_verrou:
+        if not bud_flags['pret']:
+            if len(bud_file) < 5000:
+                bud_file.append(entry)
+            return
+        bud_appliquer(entry)
+
+def bud_scanner_journaux():
+    """Au demarrage : relit les journaux (tout l'historique la premiere fois, ensuite depuis la derniere relecture moins 2 jours),
+    puis traite les evenements arrives en direct pendant ce temps. Le filtre d'horodatage evite tout double comptage."""
+    try:
+        bud_charger_etat()
+        debut_scan = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+        jdir = trouver_journal_dir()
+        if jdir and os.path.isdir(jdir):
+            limite = None
+            lu = bud_etat['lu_jusqua']
+            if lu:
+                try:
+                    limite = datetime.strptime(lu, '%Y-%m-%dT%H:%M:%SZ').replace(tzinfo=timezone.utc).timestamp() - 2 * 86400
+                except Exception:
+                    limite = None
+            fichiers = sorted(f for f in os.listdir(jdir)
+                              if f.startswith('Journal.') and f.endswith('.log')
+                              and (limite is None or os.path.getmtime(os.path.join(jdir, f)) >= limite))
+            nb = 0
+            for nom_fichier in fichiers:
+                with open(os.path.join(jdir, nom_fichier), 'r', encoding='utf-8', errors='ignore') as f:
+                    for ligne in f:
+                        if not bud_re_journal.search(ligne):
+                            continue
+                        try:
+                            e = json.loads(ligne)
+                        except Exception:
+                            continue
+                        with bud_verrou:
+                            bud_appliquer(e)
+                        nb += 1
+            with bud_verrou:
+                bud_etat['lu_jusqua'] = debut_scan
+                bud_flags['modifie'] = True
+            bud_trace('relecture : %d fichiers, %d evenements utiles, %d cycles, %d lignes en attente' % (len(fichiers), nb, len(bud_etat['cycles']), len(bud_etat['lignes'])))
+    except Exception as e:
+        bud_trace('relecture : EXCEPTION %r' % (e,))
+    finally:
+        with bud_verrou:
+            en_attente = list(bud_file)
+            del bud_file[:]
+            for e in en_attente:
+                try:
+                    bud_appliquer(e)
+                except Exception as ex:
+                    bud_trace('evenement ignore : %r' % (ex,))
+            bud_flags['pret'] = True
+        bud_sauver_etat()
+        try:
+            bud_envoyer(force=True)
+        except Exception:
+            pass
+
+def bud_envoyer(force=False):
+    """Envoie les totaux des cycles modifies (le serveur les remplace) et les nouvelles lignes du livre, par lots. Au plus un envoi toutes les 5 minutes."""
+    if bud_flags['absente'] or not bud_flags['pret']:
+        return
+    with bud_verrou:
+        if not (bud_etat['sales'] or bud_etat['lignes']):
+            return
+        if not force and time.time() - bud_flags['dernier_envoi'] < BUD_INTERVALLE_ENVOI:
+            return
+        bud_flags['dernier_envoi'] = time.time()
+    if not get_user_id():
+        bud_trace('envoi differe : get_user_id() vide (cle inconnue ou reseau)')
+        return
+    for _ in range(BUD_LOTS_PAR_PASSE):
+        with bud_verrou:
+            sales = list(bud_etat['sales'])[:BUD_LOT_CYCLES]
+            cycles = []
+            for s in sales:
+                c = bud_etat['cycles'].get(s)
+                if not c:
+                    continue
+                item = {'semaine': s, 't': dict(c['t'])}
+                if c.get('debut') is not None:
+                    item['debut'] = c['debut']
+                if c.get('fin') is not None:
+                    item['fin'] = c['fin']
+                cycles.append(item)
+            lignes = list(bud_etat['lignes'][:BUD_LOT_LIGNES])
+            if not cycles and not lignes:
+                return
+            for s in sales:
+                if s in bud_etat['sales']:
+                    bud_etat['sales'].remove(s)
+        try:
+            res = requests.post(
+                f"{SUPABASE_URL}/rest/v1/rpc/budget_releve",
+                headers=get_headers(),
+                json={'p_cycles': cycles, 'p_lignes': lignes},
+                timeout=20
+            )
+            bud_trace('budget_releve : %d cycles, %d lignes -> HTTP %s %s' % (len(cycles), len(lignes), res.status_code, (res.text or '')[:160]))
+            if res.status_code in (200, 201, 204):
+                with bud_verrou:
+                    del bud_etat['lignes'][:len(lignes)]
+                    bud_flags['modifie'] = True
+                bud_flags['echecs'] = 0
+                continue
+            if res.status_code == 404:
+                bud_flags['absente'] = True      # fonction pas encore creee en base : on ne reessaie pas
+                with bud_verrou:
+                    for s in sales:
+                        if s not in bud_etat['sales']:
+                            bud_etat['sales'].append(s)
+                return
+            raise RuntimeError('HTTP ' + str(res.status_code))
+        except Exception as e:
+            bud_trace('envoi en echec : %r' % (e,))
+            bud_flags['echecs'] += 1
+            with bud_verrou:
+                for s in sales:
+                    if s not in bud_etat['sales']:
+                        bud_etat['sales'].append(s)
+            return
+
+def bud_sauver_si_besoin():
+    """Appelee par la boucle de fond : sauvegarde l'etat s'il a change (au plus toutes les 30 secondes)."""
+    if bud_flags['modifie'] and time.time() - bud_flags['dernier_sauvetage'] >= 30:
+        bud_sauver_etat()
+
 def notifier_journal_activite(type_act, details_txt, couleur_txt="#00F0FF"):
     """Injection d'une brève marquante dans le QG (0 octet d'Egress via return=minimal)."""
     uid = get_user_id()
@@ -488,6 +1255,12 @@ def heartbeat_loop():
         except: pass
         try: pp_envoyer()   # merites Powerplay : envoi si du (au plus toutes les 5 min)
         except: pass
+        try: col_envoyer()  # colonisation : envoi regroupe si du (au plus toutes les 3 min)
+        except: pass
+        try: bud_envoyer()  # budget : totaux des cycles modifies et nouvelles lignes du livre (au plus toutes les 5 min)
+        except: pass
+        try: bud_sauver_si_besoin()
+        except: pass
         time.sleep(60)
 
 def check_for_updates():
@@ -529,10 +1302,18 @@ def plugin_start3(plugin_dir):
     threading.Thread(target=heartbeat_loop, daemon=True).start()
     threading.Thread(target=check_for_updates, daemon=True).start()
     threading.Thread(target=pp_scanner_journaux, daemon=True).start()
+    threading.Thread(target=col_scanner_journaux, daemon=True).start()
+    threading.Thread(target=bud_scanner_journaux, daemon=True).start()
     return "SYS.EDTEAM"
 
 def plugin_stop():
     try: pp_envoyer(force=True)
+    except: pass
+    try: col_envoyer(force=True)
+    except: pass
+    try: bud_envoyer(force=True)
+    except: pass
+    try: bud_sauver_etat()
     except: pass
 
 def plugin_app(parent):
@@ -596,6 +1377,14 @@ def journal_entry(cmdr, is_beta, system, station, entry, state):
     cmdr_actuel = cmdr
     if system and system != systeme_actuel: systeme_actuel = system
     event = entry.get('event')
+
+    # Colonisation : releve des chantiers, livraisons et systemes (aucun appel reseau ici)
+    try: col_traiter_evenement(entry)
+    except Exception as e: col_trace('evenement ignore : %r' % (e,))
+
+    # Budget : revenus et charges (aucun appel reseau ici)
+    try: bud_traiter_evenement(entry)
+    except Exception as e: bud_trace('evenement ignore : %r' % (e,))
 
     # Suivi CZ
     if not hasattr(journal_entry, 'cz_cache'):
