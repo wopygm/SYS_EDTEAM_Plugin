@@ -22,7 +22,7 @@ except ImportError:
     config = None
 
 plugin_name = "SYS.EDTEAM"
-PLUGIN_VERSION = "2.5"
+PLUGIN_VERSION = "2.6"
 
 SUPABASE_URL = "https://oailvdigfdoyfcydmabb.supabase.co"
 SUPABASE_KEY = "sb_publishable_AASqgRggHdIGttZHPGaWkA_VqrhuYNg"
@@ -1796,7 +1796,14 @@ def journal_entry(cmdr, is_beta, system, station, entry, state):
                     if not ordre_valide and faction_alliee and act_faction == faction_alliee.strip().lower():
                         est_action_libre = True
 
-                    if ordre_valide or est_action_libre:
+                    # Opération noire contre une AUTRE faction que celle de l'escadron : alimente le titre « L'Exécuteur » (sans ordre)
+                    est_operation_noire = False
+                    if (not ordre_valide and not est_action_libre and faction_alliee and act_faction
+                            and act_faction != faction_alliee.strip().lower()
+                            and action['type'] in ('MEURTRES', 'VOLS', 'PIRATAGE', 'CONTREBANDE')):
+                        est_operation_noire = True
+
+                    if ordre_valide or est_action_libre or est_operation_noire:
                         if ordre_valide:
                             if ordre_valide.get('type_ordre') == 'ELECTION' and action.get('is_combat', False): continue
                             if ordre_valide.get('type_ordre') == 'GUERRE' and action['type'] == 'MISSIONS':
@@ -1827,6 +1834,8 @@ def journal_entry(cmdr, is_beta, system, station, entry, state):
                                 mettre_a_jour_interface(f">_ BGS [ORDRE #{ordre_valide['id']}] : {action['type']} +{int(valeur_finale)}", "#00FF66")
                             elif action['type'] == 'COLONISATION':
                                 mettre_a_jour_interface(f">_ BÂTISSEUR : +{int(valeur_finale)} T DE FRET", "#FFD700")
+                            elif est_operation_noire:
+                                mettre_a_jour_interface(f">_ OPÉRATION NOIRE : {action['type']} (+{int(valeur_finale)})", "#FF3333")
                             else:
                                 mettre_a_jour_interface(f">_ SOUTIEN LIBRE : {action['type']} (+{int(valeur_finale)})", "#00FF66")
 
