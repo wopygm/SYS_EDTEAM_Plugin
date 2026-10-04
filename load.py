@@ -22,7 +22,7 @@ except ImportError:
     config = None
 
 plugin_name = "SYS.EDTEAM"
-PLUGIN_VERSION = "2.6"
+PLUGIN_VERSION = "2.7"
 
 SUPABASE_URL = "https://oailvdigfdoyfcydmabb.supabase.co"
 SUPABASE_KEY = "sb_publishable_AASqgRggHdIGttZHPGaWkA_VqrhuYNg"
@@ -49,16 +49,6 @@ pilot_cache = {
     'puissance_merites_cycle': 0,
     'puissance_merites_total': 0,
     'ts': 0
-}
-
-# Matériaux industriels de colonisation / chantiers
-MATERIAUX_COLONISATION = {
-    'gold', 'titanium', 'beryllium', 'steel', 'aluminium', 'copper', 'lithium',
-    'cmmcomposite', 'ceramiccomposites', 'polymers', 'insulatingmembrane',
-    'coolinghoses', 'powergenerators', 'waterpurifiers', 'structuralregulators',
-    'atmosphericprocessors', 'buildingfabricators', 'computercomponents',
-    'superconductors', 'semiconductors', 'emergencypowercells',
-    'reinforcedmountingplate', 'microcontrollers', 'semiconductor', 'superconductor'
 }
 
 def trouver_journal_dir():
@@ -1607,7 +1597,7 @@ def journal_entry(cmdr, is_beta, system, station, entry, state):
         'MarketSell', 'RedeemVoucher', 'SellExplorationData', 
         'MultiSellExplorationData', 'SellOrganicData', 'CommitCrime', 
         'CollectItem', 'CollectItems', 'DataDownloaded', 'BackpackChange', 
-        'Music', 'ReceiveText', 'Embark', 'BookDropship', 'CargoDepot'
+        'Music', 'ReceiveText', 'Embark', 'BookDropship'
     ]
 
     if entry.get('event') in bgs_events:
@@ -1709,43 +1699,15 @@ def journal_entry(cmdr, is_beta, system, station, entry, state):
                 if val > 0: 
                     actions.append({"faction": f_station, "type": "SCIENCE", "valeur": val, "system": systeme_actuel, "is_combat": False})
 
-            # Commerce & Matériaux de colonisation
+            # Commerce : une vente au marché compte comme ECONOMIE (ou CONTREBANDE si volée). Elle n'est JAMAIS une livraison de colonisation :
+            # les vraies livraisons à un chantier (ColonisationContribution) sont relevées par le module colonisation, côté serveur.
             elif evt == 'MarketSell':
                 val = entry.get('TotalSale', 0)
-                count = entry.get('Count', 0)
-                mat_raw = str(entry.get('Type', '')).lower().replace(' ', '').replace('$', '').replace('_name;', '')
-                mat_nom = entry.get('Type_Localised') or entry.get('Type', 'Matériaux')
-                
-                # Détection colonisation au tonnage
-                if count > 0 and mat_raw in MATERIAUX_COLONISATION and f_station:
-                    actions.append({
-                        "faction": f_station, 
-                        "type": "COLONISATION", 
-                        "valeur": count, 
-                        "details": str(mat_nom), 
-                        "system": systeme_actuel, 
-                        "is_combat": False
-                    })
-
-                if val > 0: 
-                    actions.append({
-                        "faction": f_station, 
-                        "type": "CONTREBANDE" if (entry.get('Stolen', False) or entry.get('IllegalGoods', False)) else "ECONOMIE", 
-                        "valeur": val, 
-                        "system": systeme_actuel, 
-                        "is_combat": False
-                    })
-
-            # Déchargement de fret / dépôts de chantiers coloniaux
-            elif evt == 'CargoDepot' and entry.get('UpdateType') == 'Deliver':
-                count = entry.get('Count', 0)
-                mat_nom = entry.get('CargoType_Localised') or entry.get('CargoType', 'Fret colonial')
-                if count > 0 and f_station:
+                if val > 0:
                     actions.append({
                         "faction": f_station,
-                        "type": "COLONISATION",
-                        "valeur": count,
-                        "details": str(mat_nom),
+                        "type": "CONTREBANDE" if (entry.get('Stolen', False) or entry.get('IllegalGoods', False)) else "ECONOMIE",
+                        "valeur": val,
                         "system": systeme_actuel,
                         "is_combat": False
                     })
@@ -1832,17 +1794,13 @@ def journal_entry(cmdr, is_beta, system, station, entry, state):
                         if res_post.status_code in [200, 201, 204]:
                             if ordre_valide:
                                 mettre_a_jour_interface(f">_ BGS [ORDRE #{ordre_valide['id']}] : {action['type']} +{int(valeur_finale)}", "#00FF66")
-                            elif action['type'] == 'COLONISATION':
-                                mettre_a_jour_interface(f">_ BÂTISSEUR : +{int(valeur_finale)} T DE FRET", "#FFD700")
                             elif est_operation_noire:
                                 mettre_a_jour_interface(f">_ OPÉRATION NOIRE : {action['type']} (+{int(valeur_finale)})", "#FF3333")
                             else:
                                 mettre_a_jour_interface(f">_ SOUTIEN LIBRE : {action['type']} (+{int(valeur_finale)})", "#00FF66")
 
                             # Brèves QG narratives (seuils sélectifs)
-                            if action['type'] == 'COLONISATION' and valeur_finale >= 200:
-                                threading.Thread(target=notifier_journal_activite, args=("COLONISATION", f"Livraison logistique : +{int(valeur_finale)} t ({action.get('details', 'Matériaux')})", "#FFD700")).start()
-                            elif action['type'] == 'CZ_VICTOIRES':
+                            if action['type'] == 'CZ_VICTOIRES':
                                 threading.Thread(target=notifier_journal_activite, args=("COMBAT", f"Victoire en zone de conflit ({action.get('intensite', 'S')}) à {systeme_actuel}", "#FF3333")).start()
                             elif action['type'] == 'MISSIONS' and valeur_finale >= 3:
                                 threading.Thread(target=notifier_journal_activite, args=("SOUTIEN", f"Mission navale validée (+{int(valeur_finale)} INF) pour la flotte", "#00FF66")).start()
