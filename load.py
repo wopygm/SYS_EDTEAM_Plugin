@@ -22,7 +22,7 @@ except ImportError:
     config = None
 
 plugin_name = "SYS.EDTEAM"
-PLUGIN_VERSION = "2.7"
+PLUGIN_VERSION = "2.8"
 
 SUPABASE_URL = "https://oailvdigfdoyfcydmabb.supabase.co"
 SUPABASE_KEY = "sb_publishable_AASqgRggHdIGttZHPGaWkA_VqrhuYNg"
@@ -1697,7 +1697,13 @@ def journal_entry(cmdr, is_beta, system, station, entry, state):
                     if evt == 'SellExplorationData' and 'TotalEarnings' not in entry:
                         val += entry.get('Bonus', 0)
                 if val > 0: 
-                    actions.append({"faction": f_station, "type": "SCIENCE", "valeur": val, "system": systeme_actuel, "is_combat": False})
+                    act_sci = {"faction": f_station, "type": "SCIENCE", "valeur": val, "system": systeme_actuel, "is_combat": False}
+                    if evt == 'SellOrganicData':
+                        # L'exobiologie ne change PAS l'influence d'une faction (seule la cartographie le fait) : elle compte pour le rang BGS
+                        # en soutien libre (station de la faction de l'escadron), mais n'est JAMAIS rattachee a une directive.
+                        act_sci["sans_directive"] = True
+                        act_sci["details"] = "Exobiologie"
+                    actions.append(act_sci)
 
             # Commerce : une vente au marché compte comme ECONOMIE (ou CONTREBANDE si volée). Elle n'est JAMAIS une livraison de colonisation :
             # les vraies livraisons à un chantier (ColonisationContribution) sont relevées par le module colonisation, côté serveur.
@@ -1750,7 +1756,7 @@ def journal_entry(cmdr, is_beta, system, station, entry, state):
 
                     if action['type'] == 'CZ_VICTOIRES' and act_faction:
                         ordre_valide = next((o for o in ordres_actifs if o.get('type_ordre') == 'GUERRE' and o.get('systeme_cible', '').strip().lower() == sys_cible_action and o.get('faction_cible', '').strip().lower() == act_faction), None)
-                    elif act_faction:
+                    elif act_faction and not action.get('sans_directive'):
                         ordre_valide = next((o for o in ordres_actifs if o.get('faction_cible', '').strip().lower() == act_faction and o.get('systeme_cible', '').strip().lower() == sys_cible_action), None)
 
                     # Est-ce un soutien libre pour notre faction alliée ?
