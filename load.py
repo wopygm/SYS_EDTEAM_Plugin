@@ -22,7 +22,7 @@ except ImportError:
     config = None
 
 plugin_name = "SYS.EDTEAM"
-PLUGIN_VERSION = "2.14"
+PLUGIN_VERSION = "2.15"
 
 SUPABASE_URL = "https://oailvdigfdoyfcydmabb.supabase.co"
 SUPABASE_KEY = "sb_publishable_AASqgRggHdIGttZHPGaWkA_VqrhuYNg"
@@ -1392,7 +1392,8 @@ def live_appliquer(e):
             'id': mid, 'nom': live_texte(e.get('LocalisedName')), 'type': live_type_mission(nom), 'faction': live_texte(e.get('Faction')),
             'sys': live_texte(e.get('DestinationSystem')), 'st': live_texte(e.get('DestinationStation')), 'exp': e.get('Expiry'),
             'rec': e.get('Reward'), 'q': _bn(e.get('Count')), 'march': live_texte(e.get('Commodity_Localised')), 'pas': _bn(e.get('PassengerCount')),
-            'don': _bn(e.get('Donation')), 'inf': e.get('Influence'), 'rep': e.get('Reputation'), 't': ts
+            'don': _bn(e.get('Donation')), 'inf': e.get('Influence'), 'rep': e.get('Reputation'), 't': ts,
+            'os': et['systeme'], 'ost': et['station']     # ou la mission a ete prise (pour le retour au commanditaire)
         }
         if len(et['missions']) > LIVE_MISSIONS_MAX:
             plus_ancienne = sorted(et['missions'].items(), key=lambda kv: str(kv[1].get('t') or ''))[0][0]
