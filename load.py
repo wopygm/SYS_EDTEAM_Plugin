@@ -22,7 +22,7 @@ except ImportError:
     config = None
 
 plugin_name = "SYS.EDTEAM"
-PLUGIN_VERSION = "2.13"
+PLUGIN_VERSION = "2.14"
 
 SUPABASE_URL = "https://oailvdigfdoyfcydmabb.supabase.co"
 SUPABASE_KEY = "sb_publishable_AASqgRggHdIGttZHPGaWkA_VqrhuYNg"
@@ -1232,15 +1232,15 @@ def mettre_a_jour_interface(texte, couleur):
 # TABLEAU DE BORD EN JEU (script SQL 77) : session en direct du pilote (soute, registre des achats et ventes, missions, position, rang).
 # Le plugin LIT LUI-MEME le journal du jeu (toutes les 2 s, uniquement les lignes ajoutees ; au lancement, tous les morceaux de la partie en cours) : il ne depend plus d'EDMC
 # pour recevoir les evenements (v2.9 : un Loadout n'arrivait pas). L'etat vit en MEMOIRE ; un instantane compact (quelques ko) part par live_releve(),
-# seulement quand quelque chose a change, au plus un envoi toutes les 15 s (un envoi de securite toutes les 5 min tant que le jeu tourne).
+# seulement quand quelque chose a change, au plus un envoi toutes les 30 s (un envoi de securite toutes les 5 min tant que le jeu tourne).
 # Les ecritures ne comptent pas dans l'egress ; la page lit sa seule ligne (session_live) en temps reel.
 # Diagnostic : creer un fichier vide live_debug.txt a cote de load.py pour activer la trace.
 # =====================================================================================================
-LIVE_INTERVALLE_ENVOI = 15
+LIVE_INTERVALLE_ENVOI = 30
 LIVE_INTERVALLE_MINEUR = 60     # secondes : simple changement de position (sauts), qui ne merite pas un envoi rapide
-LIVE_KEEPALIVE = 300
+LIVE_KEEPALIVE = 600
 LIVE_MINEURS = frozenset(('FSDJump', 'CarrierJump'))
-LIVE_REGISTRE_MAX = 40
+LIVE_REGISTRE_MAX = 30
 LIVE_MISSIONS_MAX = 40
 LIVE_TERMINEES_MAX = 30
 LIVE_EVENEMENTS = frozenset((
@@ -1418,7 +1418,11 @@ def live_appliquer(e):
                 for it in (fe.get('Influence') or []):
                     infl = str(it.get('Influence') or infl)
                 if nom_f:
-                    et['rep'][nom_f] = {'rep': str(fe.get('Reputation') or ''), 'infl': infl}
+                    deja = et['rep'].get(nom_f) or {}
+                    rep_txt = str(fe.get('Reputation') or '')
+                    et['rep'][nom_f] = {'rep': rep_txt, 'infl': infl, 'nm': int(deja.get('nm') or 0) + 1,
+                                        'pr': int(deja.get('pr') or 0) + rep_txt.count('+') - rep_txt.count('-'),
+                                        'pi': int(deja.get('pi') or 0) + infl.count('+') - infl.count('-')}   # nm = missions, pr / pi = + de reputation / d'influence cumules
             except Exception:
                 pass
     elif ev in ('MissionFailed', 'MissionAbandoned'):
@@ -1569,7 +1573,7 @@ def live_instantane():
 
 
 def live_envoyer(force=False):
-    """Envoie l'instantane si quelque chose a change (au plus un envoi toutes les 15 s, plus espace apres des echecs) ; un envoi de securite toutes les 5 minutes en jeu."""
+    """Envoie l'instantane si quelque chose a change (au plus un envoi toutes les 30 s, plus espace apres des echecs) ; un envoi de securite toutes les 5 minutes en jeu."""
     if live_flags['absente'] or not live_flags['pret']:
         return
     maintenant = time.time()
