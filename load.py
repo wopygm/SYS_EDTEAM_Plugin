@@ -22,7 +22,7 @@ except ImportError:
     config = None
 
 plugin_name = "SYS.EDTEAM"
-PLUGIN_VERSION = "2.9"
+PLUGIN_VERSION = "2.10"
 
 SUPABASE_URL = "https://oailvdigfdoyfcydmabb.supabase.co"
 SUPABASE_KEY = "sb_publishable_AASqgRggHdIGttZHPGaWkA_VqrhuYNg"
@@ -1230,8 +1230,9 @@ def mettre_a_jour_interface(texte, couleur):
 
 # =====================================================================================================
 # TABLEAU DE BORD EN JEU (script SQL 77) : session en direct du pilote (soute, registre des achats et ventes, missions, position, rang).
-# Le plugin garde l'etat en MEMOIRE (reconstruit au demarrage depuis le journal le plus recent) et en envoie un instantane compact (quelques ko) par live_releve(),
-# seulement quand quelque chose a change, au plus un envoi toutes les 15 s (un envoi de securite toutes les 5 min tant que le jeu tourne). Aucun appel reseau dans journal_entry().
+# Le plugin LIT LUI-MEME le journal du jeu (toutes les 2 s, uniquement les lignes ajoutees ; au lancement, tous les morceaux de la partie en cours) : il ne depend plus d'EDMC
+# pour recevoir les evenements (v2.9 : un Loadout n'arrivait pas). L'etat vit en MEMOIRE ; un instantane compact (quelques ko) part par live_releve(),
+# seulement quand quelque chose a change, au plus un envoi toutes les 15 s (un envoi de securite toutes les 5 min tant que le jeu tourne).
 # Les ecritures ne comptent pas dans l'egress ; la page lit sa seule ligne (session_live) en temps reel.
 # Diagnostic : creer un fichier vide live_debug.txt a cote de load.py pour activer la trace.
 # =====================================================================================================
@@ -1248,9 +1249,8 @@ LIVE_EVENEMENTS = frozenset((
 live_re_journal = re.compile('"event":"(' + '|'.join(sorted(LIVE_EVENEMENTS)) + ')"')
 
 live_verrou = threading.RLock()
-live_file = []          # evenements vus en direct pendant la relecture du journal
 live_etat = {}
-live_flags = {'pret': False, 'absente': False, 'sale': False, 'dernier_envoi': 0, 'echecs': 0, 'empreinte': '', 'dernier_ts': '', 'vus': set()}
+live_flags = {'pret': False, 'absente': False, 'sale': False, 'dernier_envoi': 0, 'echecs': 0, 'empreinte': ''}
 
 
 def live_trace(msg):
@@ -1311,8 +1311,9 @@ def live_appliquer(e):
     ts = str(e.get('timestamp') or '')
     et = live_etat
     if ev == 'Fileheader':
-        et.update(live_nouvel_etat())
-        et['debut'] = ts
+        if _bn(e.get('part') or 1) <= 1:
+            et.update(live_nouvel_etat())
+            et['debut'] = ts
         et['en_ligne'] = True
     elif ev == 'LoadGame':
         et['en_ligne'] = True
@@ -1450,74 +1451,72 @@ def live_appliquer(e):
     live_flags['sale'] = True
 
 
-def live_empreinte_evenement(e):
-    return hashlib.md5(json.dumps(e, sort_keys=True, ensure_ascii=False).encode('utf-8')).hexdigest()
-
-
-def live_appliquer_sans_doublon(e):
-    """Evite de compter deux fois un evenement lu pendant la relecture puis revu en direct : on ignore ce qui est plus ancien que le dernier applique,
-    et, a la seconde pres, ce qui a deja ete applique (empreinte du contenu)."""
-    ts = str(e.get('timestamp') or '')
-    emp = live_empreinte_evenement(e)
-    dernier = live_flags['dernier_ts']
-    if ts and dernier:
-        if ts < dernier:
-            return
-        if ts == dernier and emp in live_flags['vus']:
-            return
-    if ts != dernier:
-        live_flags['vus'] = set()
-        if ts:
-            live_flags['dernier_ts'] = ts
-    live_flags['vus'].add(emp)
-    live_appliquer(e)
+live_suivi = {'prefixe': None, 'fichier': None, 'pos': 0}
 
 
 def live_traiter_evenement(e):
-    """Appelee pour chaque evenement en direct (journal_entry). Pendant la relecture du journal, les evenements attendent dans live_file."""
+    """Applique un evenement du journal a l'etat de la session (utilise par la lecture du journal ci-dessous)."""
     if e.get('event') not in LIVE_EVENEMENTS:
         return
     with live_verrou:
-        if not live_flags['pret']:
-            if len(live_file) < 5000:
-                live_file.append(e)
-            return
-        live_appliquer_sans_doublon(e)
+        live_appliquer(e)
 
 
-def live_scanner_journal():
-    """Au demarrage : relit le journal le plus recent (la session en cours) pour reconstruire l'etat, puis traite les evenements arrives en direct pendant ce temps."""
+def live_lire_morceau(chemin, debut):
+    """Lit les lignes COMPLETES d'un fichier du journal a partir de la position donnee et les applique ; renvoie la nouvelle position."""
     try:
-        jdir = trouver_journal_dir()
-        if jdir and os.path.isdir(jdir):
-            fichiers = sorted(f for f in os.listdir(jdir) if f.startswith('Journal.') and f.endswith('.log'))
-            if fichiers:
-                nb = 0
-                with open(os.path.join(jdir, fichiers[-1]), 'r', encoding='utf-8', errors='ignore') as f:
-                    for ligne in f:
-                        if not live_re_journal.search(ligne):
-                            continue
-                        try:
-                            e = json.loads(ligne)
-                        except Exception:
-                            continue
-                        with live_verrou:
-                            live_appliquer_sans_doublon(e)
-                        nb += 1
-                live_trace('relecture de %s : %d evenements utiles, %d missions, %d operations' % (fichiers[-1], nb, len(live_etat['missions']), len(live_etat['registre'])))
-    except Exception as ex:
-        live_trace('relecture : EXCEPTION %r' % (ex,))
-    finally:
-        with live_verrou:
-            en_attente = list(live_file)
-            del live_file[:]
-            for e in en_attente:
-                try:
-                    live_appliquer_sans_doublon(e)
-                except Exception as ex:
-                    live_trace('evenement ignore : %r' % (ex,))
-            live_flags['pret'] = True
-            live_flags['sale'] = True
+        taille = os.path.getsize(chemin)
+    except OSError:
+        return debut
+    if taille < debut:
+        debut = 0
+    if taille == debut:
+        return debut
+    with open(chemin, 'rb') as f:
+        f.seek(debut)
+        data = f.read()
+    fin = data.rfind(b'\n')
+    if fin < 0:
+        return debut          # derniere ligne encore incomplete : on attend la suite
+    nb = 0
+    for ligne in data[:fin + 1].decode('utf-8', errors='ignore').splitlines():
+        if not live_re_journal.search(ligne):
+            continue
+        try:
+            e = json.loads(ligne)
+        except Exception:
+            continue
+        live_traiter_evenement(e)
+        nb += 1
+    if nb:
+        live_trace('lu %s : %d evenements utiles (octets %d a %d)' % (os.path.basename(chemin), nb, debut, debut + fin + 1))
+    return debut + fin + 1
+
+
+def live_suivre():
+    """Une passe de suivi du journal : au demarrage (ou a chaque nouvelle partie), relit TOUS les morceaux de la session en cours dans l'ordre, puis lit seulement
+    ce qui a ete ajoute depuis. On ne depend plus d'EDMC pour recevoir les evenements : tout ce que le journal contient deja au lancement est pris en compte."""
+    jdir = trouver_journal_dir()
+    if not jdir or not os.path.isdir(jdir):
+        return
+    fichiers = sorted(f for f in os.listdir(jdir) if f.startswith('Journal.') and f.endswith('.log') and f.count('.') >= 3)
+    if not fichiers:
+        return
+    dernier = fichiers[-1]
+    prefixe = dernier.split('.')[1]
+    suivi = live_suivi
+    if suivi['prefixe'] != prefixe:
+        # premiere passe ou nouvelle partie : l'evenement Fileheader du premier morceau remet l'etat a zero
+        morceaux = [f for f in fichiers if f.split('.')[1] == prefixe]
+        for m in morceaux[:-1]:
+            live_lire_morceau(os.path.join(jdir, m), 0)
+        suivi['prefixe'] = prefixe
+        suivi['fichier'] = morceaux[-1]
+        suivi['pos'] = 0
+    elif suivi['fichier'] != dernier:
+        suivi['fichier'] = dernier      # morceau suivant de la meme partie : l'etat continue
+        suivi['pos'] = 0
+    suivi['pos'] = live_lire_morceau(os.path.join(jdir, suivi['fichier']), suivi['pos'])
 
 
 def live_lire_fichier(nom):
@@ -1606,10 +1605,15 @@ def live_envoyer(force=False):
 def live_boucle():
     while True:
         try:
+            live_suivre()
+        except Exception as ex:
+            live_trace('suivi du journal : %r' % (ex,))
+        live_flags['pret'] = True
+        try:
             live_envoyer()
         except Exception as ex:
-            live_trace('boucle : %r' % (ex,))
-        time.sleep(5)
+            live_trace('envoi : %r' % (ex,))
+        time.sleep(2)
 
 
 def heartbeat_loop():
@@ -1678,7 +1682,6 @@ def plugin_start3(plugin_dir):
     threading.Thread(target=pp_scanner_journaux, daemon=True).start()
     threading.Thread(target=col_scanner_journaux, daemon=True).start()
     threading.Thread(target=bud_scanner_journaux, daemon=True).start()
-    threading.Thread(target=live_scanner_journal, daemon=True).start()
     threading.Thread(target=live_boucle, daemon=True).start()
     return "SYS.EDTEAM"
 
@@ -1766,10 +1769,6 @@ def journal_entry(cmdr, is_beta, system, station, entry, state):
     # Budget : revenus et charges (aucun appel reseau ici)
     try: bud_traiter_evenement(entry)
     except Exception as e: bud_trace('evenement ignore : %r' % (e,))
-
-    # Tableau de bord en jeu : session en direct (aucun appel reseau ici)
-    try: live_traiter_evenement(entry)
-    except Exception as e: live_trace('evenement ignore : %r' % (e,))
 
     # Suivi CZ
     if not hasattr(journal_entry, 'cz_cache'):
