@@ -1548,7 +1548,7 @@ def live_instantane():
         for it in (cargo.get('Inventory') or []):
             cle = str(it.get('Name') or '').lower()
             p = et['paye'].get(cle)
-            item = {'n': live_texte(it.get('Name_Localised') or it.get('Name')), 'q': _bn(it.get('Count'))}
+            item = {'n': live_texte(it.get('Name_Localised') or it.get('Name')), 'q': _bn(it.get('Count')), 'k': str(it.get('Name') or '').lower()}   # k = nom interne (sert a retrouver la marchandise chez Spansh)
             if it.get('MissionID'):
                 item['m'] = 1
             if it.get('Stolen'):
