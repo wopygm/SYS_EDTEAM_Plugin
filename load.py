@@ -22,7 +22,7 @@ except ImportError:
     config = None
 
 plugin_name = "SYS.EDTEAM"
-PLUGIN_VERSION = "2.10"
+PLUGIN_VERSION = "2.11"
 
 SUPABASE_URL = "https://oailvdigfdoyfcydmabb.supabase.co"
 SUPABASE_KEY = "sb_publishable_AASqgRggHdIGttZHPGaWkA_VqrhuYNg"
@@ -1237,7 +1237,9 @@ def mettre_a_jour_interface(texte, couleur):
 # Diagnostic : creer un fichier vide live_debug.txt a cote de load.py pour activer la trace.
 # =====================================================================================================
 LIVE_INTERVALLE_ENVOI = 15
+LIVE_INTERVALLE_MINEUR = 60     # secondes : simple changement de position (sauts), qui ne merite pas un envoi rapide
 LIVE_KEEPALIVE = 300
+LIVE_MINEURS = frozenset(('FSDJump', 'CarrierJump'))
 LIVE_REGISTRE_MAX = 40
 LIVE_MISSIONS_MAX = 40
 LIVE_TERMINEES_MAX = 30
@@ -1250,7 +1252,7 @@ live_re_journal = re.compile('"event":"(' + '|'.join(sorted(LIVE_EVENEMENTS)) + 
 
 live_verrou = threading.RLock()
 live_etat = {}
-live_flags = {'pret': False, 'absente': False, 'sale': False, 'dernier_envoi': 0, 'echecs': 0, 'empreinte': ''}
+live_flags = {'pret': False, 'absente': False, 'sale': False, 'dernier_envoi': 0, 'echecs': 0, 'empreinte': '', 'urgent': False}
 
 
 def live_trace(msg):
@@ -1268,7 +1270,7 @@ def live_trace(msg):
 def live_nouvel_etat():
     return {
         'debut': None, 'en_ligne': False, 'systeme': '', 'station': '', 'amarre': False, 'pos': None,
-        'vaisseau': {'nom': '', 'modele': '', 'cap': 0},
+        'vaisseau': {'nom': '', 'modele': '', 'cap': 0, 'saut': 0},
         'paye': {},                      # marchandise -> [quantite, cout total] : prix moyen paye
         'registre': [], 'tot': {'achats': 0, 'ventes': 0, 'benef': 0, 'tonnes': 0, 'nb': 0},
         'missions': {}, 'terminees': [], 'rep': {}, 'rang': {}, 'prog': {}
@@ -1326,6 +1328,10 @@ def live_appliquer(e):
         et['vaisseau']['nom'] = live_texte(e.get('ShipName') or et['vaisseau']['nom'])
         try:
             et['vaisseau']['cap'] = int(e.get('CargoCapacity') or 0)
+        except Exception:
+            pass
+        try:
+            et['vaisseau']['saut'] = round(float(e.get('MaxJumpRange') or 0), 1)      # portee de saut a vide : sert a regler la feuille de route
         except Exception:
             pass
     elif ev in ('Location', 'FSDJump', 'CarrierJump'):
@@ -1449,6 +1455,8 @@ def live_appliquer(e):
         et['en_ligne'] = False
     # 'Cargo' : la soute est relue dans Cargo.json au moment de l'envoi ; l'evenement sert seulement a declencher un envoi
     live_flags['sale'] = True
+    if ev not in LIVE_MINEURS:
+        live_flags['urgent'] = True
 
 
 live_suivi = {'prefixe': None, 'fichier': None, 'pos': 0}
@@ -1571,11 +1579,14 @@ def live_envoyer(force=False):
         if not force:
             if not (sale or keepalive):
                 return
-            if maintenant - live_flags['dernier_envoi'] < LIVE_INTERVALLE_ENVOI * (1 + min(live_flags['echecs'], 8)):
+            base = LIVE_INTERVALLE_ENVOI if live_flags['urgent'] else LIVE_INTERVALLE_MINEUR
+            if maintenant - live_flags['dernier_envoi'] < base * (1 + min(live_flags['echecs'], 8)):
                 return
         live_flags['sale'] = False
+        live_flags['urgent'] = False
     if not get_user_id():
         live_flags['sale'] = True
+        live_flags['urgent'] = True
         live_flags['dernier_envoi'] = maintenant
         return
     snap = live_instantane()
@@ -1600,6 +1611,7 @@ def live_envoyer(force=False):
         live_trace('envoi en echec : %r' % (ex,))
         live_flags['echecs'] += 1
         live_flags['sale'] = True
+        live_flags['urgent'] = True
 
 
 def live_boucle():
