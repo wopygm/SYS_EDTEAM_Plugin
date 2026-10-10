@@ -22,7 +22,7 @@ except ImportError:
     config = None
 
 plugin_name = "SYS.EDTEAM"
-PLUGIN_VERSION = "2.12"
+PLUGIN_VERSION = "2.13"
 
 SUPABASE_URL = "https://oailvdigfdoyfcydmabb.supabase.co"
 SUPABASE_KEY = "sb_publishable_AASqgRggHdIGttZHPGaWkA_VqrhuYNg"
@@ -1768,6 +1768,90 @@ def sync_conflits_supabase(systeme, conflits):
 # ==========================================
 # ROUTEUR PRINCIPAL
 # ==========================================
+# =====================================================================================================
+# MEMOIRE DES MISSIONS ACCEPTEES (BGS) : qui les a donnees, ou elles ont ete acceptees, ou elles vont.
+# Elle sert, a la fin ou a l'abandon d'une mission, a la rattacher a la bonne directive (faction + systeme d'ORIGINE de la mission). Elle etait gardee en memoire seulement :
+# chaque redemarrage d'EDMC (mise a jour du plugin, plantage) l'effacait, et une mission terminee ensuite etait rattachee au systeme ou se trouvait le pilote (donc a aucune directive).
+# Desormais : gardee sur disque (bgs_missions.json) ET reconstituee au demarrage depuis le journal de la partie en cours.
+# =====================================================================================================
+BGS_MISSIONS_FICHIER = 'bgs_missions.json'
+BGS_MISSIONS_MAX = 300
+bgs_re_mission = re.compile('"event":"(Location|FSDJump|CarrierJump|MissionAccepted)"')
+
+
+def bgs_chemin_missions():
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), BGS_MISSIONS_FICHIER)
+
+
+def bgs_infos_mission(entry, systeme):
+    nom = str(entry.get('Name', '')).lower()
+    return {
+        'faction': entry.get('Faction', ''),
+        'system': systeme,
+        'dest_system': entry.get('DestinationSystem', systeme),
+        'is_combat': any(k in nom for k in ['massacre', 'assassin', 'kill', 'pirat', 'combat', 'destroy', 'skimmer']),
+        'is_pirate': any(k in nom for k in ['pirat', 'deserter', 'anarchy']),
+        't': entry.get('timestamp', '')
+    }
+
+
+def bgs_sauver_missions(missions):
+    try:
+        gardes = sorted(missions.items(), key=lambda kv: str((kv[1] or {}).get('t') or ''))[-BGS_MISSIONS_MAX:]
+        tmp = bgs_chemin_missions() + '.tmp'
+        with open(tmp, 'w', encoding='utf-8') as f:
+            json.dump({str(k): v for k, v in gardes}, f)
+        os.replace(tmp, bgs_chemin_missions())
+    except Exception as e:
+        logging.error(f"[SYS_EDTEAM] Sauvegarde des missions impossible : {e}")
+
+
+def bgs_reconstituer_missions(missions):
+    """Relit les journaux de la partie en cours (tous les morceaux, dans l'ordre) : pour chaque mission acceptee qu'on ne connait pas encore, retrouve le systeme ou elle a ete acceptee."""
+    jdir = trouver_journal_dir()
+    if not jdir or not os.path.isdir(jdir):
+        return
+    fichiers = sorted(f for f in os.listdir(jdir) if f.startswith('Journal.') and f.endswith('.log') and f.count('.') >= 3)
+    if not fichiers:
+        return
+    prefixe = fichiers[-1].split('.')[1]
+    systeme = ''
+    for nom in [f for f in fichiers if f.split('.')[1] == prefixe]:
+        with open(os.path.join(jdir, nom), 'r', encoding='utf-8', errors='ignore') as f:
+            for ligne in f:
+                if not bgs_re_mission.search(ligne):
+                    continue
+                try:
+                    e = json.loads(ligne)
+                except Exception:
+                    continue
+                ev = e.get('event')
+                if ev == 'MissionAccepted':
+                    m_id = e.get('MissionID')
+                    if m_id and m_id not in missions:
+                        missions[m_id] = bgs_infos_mission(e, systeme)
+                elif e.get('StarSystem'):
+                    systeme = e.get('StarSystem')
+
+
+def bgs_charger_missions():
+    missions = {}
+    try:
+        with open(bgs_chemin_missions(), 'r', encoding='utf-8') as f:
+            for k, v in json.load(f).items():
+                missions[int(k)] = v
+    except Exception:
+        pass
+    try:
+        avant = len(missions)
+        bgs_reconstituer_missions(missions)
+        if len(missions) != avant:
+            bgs_sauver_missions(missions)
+    except Exception as e:
+        logging.error(f"[SYS_EDTEAM] Reconstitution des missions impossible : {e}")
+    return missions
+
+
 def journal_entry(cmdr, is_beta, system, station, entry, state):
     global systeme_actuel, cmdr_actuel
     cmdr_actuel = cmdr
@@ -1975,7 +2059,7 @@ def journal_entry(cmdr, is_beta, system, station, entry, state):
     # MODULE BGS, SOUTIEN LIBRE & COLONISATION
     # ==========================================
     if not hasattr(journal_entry, 'bgs_cache'): 
-        journal_entry.bgs_cache = {'missions': {}, 'station_faction': '', 'ordres': [], 'ordres_ts': 0}
+        journal_entry.bgs_cache = {'missions': bgs_charger_missions(), 'station_faction': '', 'ordres': [], 'ordres_ts': 0}
     
     if entry.get('event') in ['Docked', 'Location', 'ApproachSettlement']:
         faction_info = entry.get('StationFaction') or entry.get('SystemFaction')
@@ -1986,17 +2070,9 @@ def journal_entry(cmdr, is_beta, system, station, entry, state):
 
     if entry.get('event') == 'MissionAccepted': 
         m_id = entry.get('MissionID')
-        m_name = entry.get('Name', '').lower()
-        est_combat = any(k in m_name for k in ['massacre', 'assassin', 'kill', 'pirat', 'combat', 'destroy', 'skimmer'])
-        est_pirate = any(k in m_name for k in ['pirat', 'deserter', 'anarchy'])
         if m_id:
-            journal_entry.bgs_cache['missions'][m_id] = {
-                'faction': entry.get('Faction', ''),
-                'system': system or systeme_actuel,
-                'dest_system': entry.get('DestinationSystem', system or systeme_actuel),
-                'is_combat': est_combat,
-                'is_pirate': est_pirate
-            }
+            journal_entry.bgs_cache['missions'][m_id] = bgs_infos_mission(entry, system or systeme_actuel)
+            bgs_sauver_missions(journal_entry.bgs_cache['missions'])
 
     bgs_events = [
         'MissionCompleted', 'MissionFailed', 'MissionAbandoned', 
@@ -2080,7 +2156,9 @@ def journal_entry(cmdr, is_beta, system, station, entry, state):
                 m_id = entry.get('MissionID')
                 m_info = journal_entry.bgs_cache.get('missions', {}).get(m_id, {})
                 if not (isinstance(m_info, dict) and m_info.get('deja_compte')):
-                    if isinstance(m_info, dict): m_info['deja_compte'] = True
+                    if isinstance(m_info, dict):
+                        m_info['deja_compte'] = True
+                        bgs_sauver_missions(journal_entry.bgs_cache['missions'])
                     f = m_info.get('faction') if isinstance(m_info, dict) else (m_info or '')
                     s = m_info.get('system') if isinstance(m_info, dict) else systeme_actuel
                     if f: 
