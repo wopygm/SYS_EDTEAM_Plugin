@@ -22,7 +22,7 @@ except ImportError:
     config = None
 
 plugin_name = "SYS.EDTEAM"
-PLUGIN_VERSION = "2.8"
+PLUGIN_VERSION = "2.9"
 
 SUPABASE_URL = "https://oailvdigfdoyfcydmabb.supabase.co"
 SUPABASE_KEY = "sb_publishable_AASqgRggHdIGttZHPGaWkA_VqrhuYNg"
@@ -1228,6 +1228,390 @@ def mettre_a_jour_interface(texte, couleur):
         try: status_label.after(0, lambda t=texte, c=couleur: status_label.config(text=t, fg=c))
         except: pass
 
+# =====================================================================================================
+# TABLEAU DE BORD EN JEU (script SQL 77) : session en direct du pilote (soute, registre des achats et ventes, missions, position, rang).
+# Le plugin garde l'etat en MEMOIRE (reconstruit au demarrage depuis le journal le plus recent) et en envoie un instantane compact (quelques ko) par live_releve(),
+# seulement quand quelque chose a change, au plus un envoi toutes les 15 s (un envoi de securite toutes les 5 min tant que le jeu tourne). Aucun appel reseau dans journal_entry().
+# Les ecritures ne comptent pas dans l'egress ; la page lit sa seule ligne (session_live) en temps reel.
+# Diagnostic : creer un fichier vide live_debug.txt a cote de load.py pour activer la trace.
+# =====================================================================================================
+LIVE_INTERVALLE_ENVOI = 15
+LIVE_KEEPALIVE = 300
+LIVE_REGISTRE_MAX = 40
+LIVE_MISSIONS_MAX = 40
+LIVE_TERMINEES_MAX = 30
+LIVE_EVENEMENTS = frozenset((
+    'Fileheader', 'LoadGame', 'Loadout', 'Location', 'FSDJump', 'CarrierJump', 'Docked', 'Undocked',
+    'MarketBuy', 'MarketSell', 'Cargo', 'MissionAccepted', 'MissionCompleted', 'MissionFailed',
+    'MissionAbandoned', 'MissionRedirected', 'Missions', 'Rank', 'Progress', 'Promotion', 'Shutdown'
+))
+live_re_journal = re.compile('"event":"(' + '|'.join(sorted(LIVE_EVENEMENTS)) + ')"')
+
+live_verrou = threading.RLock()
+live_file = []          # evenements vus en direct pendant la relecture du journal
+live_etat = {}
+live_flags = {'pret': False, 'absente': False, 'sale': False, 'dernier_envoi': 0, 'echecs': 0, 'empreinte': '', 'dernier_ts': '', 'vus': set()}
+
+
+def live_trace(msg):
+    """Diagnostic : n'ecrit QUE si un fichier live_debug.txt existe deja a cote de load.py (le creer vide pour activer)."""
+    try:
+        chemin = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'live_debug.txt')
+        if not os.path.exists(chemin):
+            return
+        with open(chemin, 'a', encoding='utf-8') as f:
+            f.write(datetime.now().strftime('%H:%M:%S') + ' ' + str(msg) + chr(10))
+    except Exception:
+        pass
+
+
+def live_nouvel_etat():
+    return {
+        'debut': None, 'en_ligne': False, 'systeme': '', 'station': '', 'amarre': False, 'pos': None,
+        'vaisseau': {'nom': '', 'modele': '', 'cap': 0},
+        'paye': {},                      # marchandise -> [quantite, cout total] : prix moyen paye
+        'registre': [], 'tot': {'achats': 0, 'ventes': 0, 'benef': 0, 'tonnes': 0, 'nb': 0},
+        'missions': {}, 'terminees': [], 'rep': {}, 'rang': {}, 'prog': {}
+    }
+
+
+live_etat.update(live_nouvel_etat())
+
+
+def live_ts(ts):
+    try:
+        return datetime.strptime(str(ts)[:19], '%Y-%m-%dT%H:%M:%S').replace(tzinfo=timezone.utc)
+    except Exception:
+        return None
+
+
+def live_texte(s):
+    return str(s or '').replace('&nbsp;', ' ').replace(chr(160), ' ').strip()
+
+
+def live_type_mission(nom):
+    n = str(nom or '').lower()
+    for cle, mot in (('don', 'altruism'), ('passagers', 'passenger'), ('courrier', 'courier'), ('collecte', 'collect'), ('livraison', 'delivery'),
+                     ('sauvetage', 'salvage'), ('minage', 'mining'), ('massacre', 'massacre'), ('assassinat', 'assassinate'), ('exploration', 'sightsee')):
+        if mot in n:
+            return cle
+    return 'autre'
+
+
+def live_ajouter_registre(ligne):
+    reg = live_etat['registre']
+    reg.append(ligne)
+    if len(reg) > LIVE_REGISTRE_MAX:
+        del reg[:len(reg) - LIVE_REGISTRE_MAX]
+
+
+def live_appliquer(e):
+    """Met a jour l'etat de la session avec un evenement du journal. Appelee sous live_verrou."""
+    ev = e.get('event')
+    ts = str(e.get('timestamp') or '')
+    et = live_etat
+    if ev == 'Fileheader':
+        et.update(live_nouvel_etat())
+        et['debut'] = ts
+        et['en_ligne'] = True
+    elif ev == 'LoadGame':
+        et['en_ligne'] = True
+        if not et['debut']:
+            et['debut'] = ts
+        et['vaisseau']['modele'] = live_texte(e.get('Ship_Localised') or e.get('Ship'))
+        et['vaisseau']['nom'] = live_texte(e.get('ShipName'))
+    elif ev == 'Loadout':
+        et['vaisseau']['modele'] = live_texte(e.get('Ship') or et['vaisseau']['modele'])
+        et['vaisseau']['nom'] = live_texte(e.get('ShipName') or et['vaisseau']['nom'])
+        try:
+            et['vaisseau']['cap'] = int(e.get('CargoCapacity') or 0)
+        except Exception:
+            pass
+    elif ev in ('Location', 'FSDJump', 'CarrierJump'):
+        if e.get('StarSystem'):
+            et['systeme'] = live_texte(e.get('StarSystem'))
+        if isinstance(e.get('StarPos'), list) and len(e.get('StarPos')) == 3:
+            et['pos'] = [round(float(v), 2) for v in e.get('StarPos')]
+        amarre = bool(e.get('Docked')) if ev != 'FSDJump' else False
+        et['amarre'] = amarre
+        et['station'] = live_texte(e.get('StationName')) if amarre else ''
+    elif ev == 'Docked':
+        et['amarre'] = True
+        et['station'] = live_texte(e.get('StationName'))
+        if e.get('StarSystem'):
+            et['systeme'] = live_texte(e.get('StarSystem'))
+    elif ev == 'Undocked':
+        et['amarre'] = False
+        et['station'] = ''
+    elif ev == 'MarketBuy':
+        q = _bn(e.get('Count'))
+        cout = _bn(e.get('TotalCost'))
+        cle = str(e.get('Type') or '').lower()
+        p = et['paye'].setdefault(cle, [0, 0])
+        p[0] += q
+        p[1] += cout
+        et['tot']['achats'] += cout
+        et['tot']['nb'] += 1
+        live_ajouter_registre({'t': ts, 'k': 'A', 'n': live_texte(e.get('Type_Localised') or e.get('Type')), 'q': q, 'p': _bn(e.get('BuyPrice')), 'b': -cout,
+                               's': et['station'], 'y': et['systeme']})
+    elif ev == 'MarketSell':
+        q = _bn(e.get('Count'))
+        vente = _bn(e.get('TotalSale'))
+        paye_moy = _bn(e.get('AvgPricePaid'))
+        benef = vente - paye_moy * q
+        cle = str(e.get('Type') or '').lower()
+        p = et['paye'].get(cle)
+        if p and p[0] > 0:
+            unite = p[1] / float(p[0])
+            p[0] -= q
+            p[1] = int(unite * max(p[0], 0))
+            if p[0] <= 0:
+                del et['paye'][cle]
+        et['tot']['ventes'] += vente
+        et['tot']['benef'] += benef
+        et['tot']['tonnes'] += q
+        et['tot']['nb'] += 1
+        ligne = {'t': ts, 'k': 'V', 'n': live_texte(e.get('Type_Localised') or e.get('Type')), 'q': q, 'p': _bn(e.get('SellPrice')), 'b': benef,
+                 's': et['station'], 'y': et['systeme']}
+        if e.get('BlackMarket'):
+            ligne['nm'] = 1
+        live_ajouter_registre(ligne)
+    elif ev == 'MissionAccepted':
+        mid = e.get('MissionID')
+        if mid is None:
+            return
+        nom = e.get('Name')
+        et['missions'][str(mid)] = {
+            'id': mid, 'nom': live_texte(e.get('LocalisedName')), 'type': live_type_mission(nom), 'faction': live_texte(e.get('Faction')),
+            'sys': live_texte(e.get('DestinationSystem')), 'st': live_texte(e.get('DestinationStation')), 'exp': e.get('Expiry'),
+            'rec': e.get('Reward'), 'q': _bn(e.get('Count')), 'march': live_texte(e.get('Commodity_Localised')), 'pas': _bn(e.get('PassengerCount')),
+            'don': _bn(e.get('Donation')), 'inf': e.get('Influence'), 'rep': e.get('Reputation'), 't': ts
+        }
+        if len(et['missions']) > LIVE_MISSIONS_MAX:
+            plus_ancienne = sorted(et['missions'].items(), key=lambda kv: str(kv[1].get('t') or ''))[0][0]
+            del et['missions'][plus_ancienne]
+    elif ev == 'MissionRedirected':
+        m = et['missions'].get(str(e.get('MissionID')))
+        if m:
+            if e.get('NewDestinationSystem'):
+                m['sys'] = live_texte(e.get('NewDestinationSystem'))
+            if e.get('NewDestinationStation'):
+                m['st'] = live_texte(e.get('NewDestinationStation'))
+    elif ev == 'MissionCompleted':
+        mid = str(e.get('MissionID'))
+        m = et['missions'].pop(mid, None)
+        et['terminees'].append({'id': e.get('MissionID'), 'nom': live_texte(e.get('LocalisedName') or (m or {}).get('nom')), 'faction': live_texte(e.get('Faction')),
+                                'rec': _bn(e.get('Reward')) or _bn(e.get('Donated')), 'type': (m or {}).get('type') or live_type_mission(e.get('Name')), 't': ts})
+        if len(et['terminees']) > LIVE_TERMINEES_MAX:
+            del et['terminees'][:len(et['terminees']) - LIVE_TERMINEES_MAX]
+        for fe in (e.get('FactionEffects') or []):
+            try:
+                nom_f = live_texte(fe.get('Faction'))
+                infl = ''
+                for it in (fe.get('Influence') or []):
+                    infl = str(it.get('Influence') or infl)
+                if nom_f:
+                    et['rep'][nom_f] = {'rep': str(fe.get('Reputation') or ''), 'infl': infl}
+            except Exception:
+                pass
+    elif ev in ('MissionFailed', 'MissionAbandoned'):
+        et['missions'].pop(str(e.get('MissionID')), None)
+    elif ev == 'Missions':
+        # liste des missions en cours a la connexion : on retire celles qui n'y sont plus, on ajoute (minimalement) celles qu'on ne connaissait pas
+        actives = {}
+        for a in (e.get('Active') or []):
+            actives[str(a.get('MissionID'))] = a
+        for mid in list(et['missions'].keys()):
+            if mid not in actives:
+                del et['missions'][mid]
+        t0 = live_ts(ts)
+        for mid, a in actives.items():
+            if mid not in et['missions']:
+                exp = None
+                if t0 is not None and a.get('Expires') is not None:
+                    try:
+                        exp = (t0 + timedelta(seconds=int(a.get('Expires')))).strftime('%Y-%m-%dT%H:%M:%SZ')
+                    except Exception:
+                        exp = None
+                et['missions'][mid] = {'id': a.get('MissionID'), 'nom': live_texte(a.get('Name')), 'type': live_type_mission(a.get('Name')), 'faction': '', 'sys': '', 'st': '',
+                                       'exp': exp, 'rec': None, 'q': 0, 'march': '', 'pas': 0, 'don': 0, 'inf': None, 'rep': None, 't': ts}
+    elif ev == 'Rank':
+        et['rang'] = {k: v for k, v in e.items() if k not in ('timestamp', 'event')}
+    elif ev == 'Progress':
+        et['prog'] = {k: v for k, v in e.items() if k not in ('timestamp', 'event')}
+    elif ev == 'Promotion':
+        for k, v in e.items():
+            if k not in ('timestamp', 'event'):
+                et['rang'][k] = v
+                et['prog'][k] = 0
+    elif ev == 'Shutdown':
+        et['en_ligne'] = False
+    # 'Cargo' : la soute est relue dans Cargo.json au moment de l'envoi ; l'evenement sert seulement a declencher un envoi
+    live_flags['sale'] = True
+
+
+def live_empreinte_evenement(e):
+    return hashlib.md5(json.dumps(e, sort_keys=True, ensure_ascii=False).encode('utf-8')).hexdigest()
+
+
+def live_appliquer_sans_doublon(e):
+    """Evite de compter deux fois un evenement lu pendant la relecture puis revu en direct : on ignore ce qui est plus ancien que le dernier applique,
+    et, a la seconde pres, ce qui a deja ete applique (empreinte du contenu)."""
+    ts = str(e.get('timestamp') or '')
+    emp = live_empreinte_evenement(e)
+    dernier = live_flags['dernier_ts']
+    if ts and dernier:
+        if ts < dernier:
+            return
+        if ts == dernier and emp in live_flags['vus']:
+            return
+    if ts != dernier:
+        live_flags['vus'] = set()
+        if ts:
+            live_flags['dernier_ts'] = ts
+    live_flags['vus'].add(emp)
+    live_appliquer(e)
+
+
+def live_traiter_evenement(e):
+    """Appelee pour chaque evenement en direct (journal_entry). Pendant la relecture du journal, les evenements attendent dans live_file."""
+    if e.get('event') not in LIVE_EVENEMENTS:
+        return
+    with live_verrou:
+        if not live_flags['pret']:
+            if len(live_file) < 5000:
+                live_file.append(e)
+            return
+        live_appliquer_sans_doublon(e)
+
+
+def live_scanner_journal():
+    """Au demarrage : relit le journal le plus recent (la session en cours) pour reconstruire l'etat, puis traite les evenements arrives en direct pendant ce temps."""
+    try:
+        jdir = trouver_journal_dir()
+        if jdir and os.path.isdir(jdir):
+            fichiers = sorted(f for f in os.listdir(jdir) if f.startswith('Journal.') and f.endswith('.log'))
+            if fichiers:
+                nb = 0
+                with open(os.path.join(jdir, fichiers[-1]), 'r', encoding='utf-8', errors='ignore') as f:
+                    for ligne in f:
+                        if not live_re_journal.search(ligne):
+                            continue
+                        try:
+                            e = json.loads(ligne)
+                        except Exception:
+                            continue
+                        with live_verrou:
+                            live_appliquer_sans_doublon(e)
+                        nb += 1
+                live_trace('relecture de %s : %d evenements utiles, %d missions, %d operations' % (fichiers[-1], nb, len(live_etat['missions']), len(live_etat['registre'])))
+    except Exception as ex:
+        live_trace('relecture : EXCEPTION %r' % (ex,))
+    finally:
+        with live_verrou:
+            en_attente = list(live_file)
+            del live_file[:]
+            for e in en_attente:
+                try:
+                    live_appliquer_sans_doublon(e)
+                except Exception as ex:
+                    live_trace('evenement ignore : %r' % (ex,))
+            live_flags['pret'] = True
+            live_flags['sale'] = True
+
+
+def live_lire_fichier(nom):
+    try:
+        jdir = trouver_journal_dir()
+        if jdir:
+            with open(os.path.join(jdir, nom), 'r', encoding='utf-8') as f:
+                return json.load(f)
+    except Exception:
+        pass
+    return None
+
+
+def live_instantane():
+    """Construit l'instantane envoye au serveur (aucun appel reseau). La soute vient de Cargo.json, les credits de Status.json."""
+    cargo = live_lire_fichier('Cargo.json') or {}
+    statut = live_lire_fichier('Status.json') or {}
+    with live_verrou:
+        et = live_etat
+        items = []
+        for it in (cargo.get('Inventory') or []):
+            cle = str(it.get('Name') or '').lower()
+            p = et['paye'].get(cle)
+            item = {'n': live_texte(it.get('Name_Localised') or it.get('Name')), 'q': _bn(it.get('Count'))}
+            if it.get('MissionID'):
+                item['m'] = 1
+            if it.get('Stolen'):
+                item['v'] = 1
+            if p and p[0] > 0 and not it.get('MissionID'):
+                item['paye'] = int(p[1] / float(p[0]))
+            items.append(item)
+        missions = sorted(et['missions'].values(), key=lambda m: str(m.get('exp') or '9999'))
+        return {
+            'v': 1, 'en_ligne': et['en_ligne'], 'debut': et['debut'], 'maj': datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'),
+            'systeme': et['systeme'], 'station': et['station'], 'amarre': et['amarre'], 'pos': et['pos'],
+            'vaisseau': dict(et['vaisseau']), 'credits': statut.get('Balance'),
+            'soute': {'cap': et['vaisseau'].get('cap') or 0, 'items': items},
+            'registre': list(et['registre']), 'tot': dict(et['tot']),
+            'missions': missions, 'terminees': list(et['terminees']), 'rep': dict(et['rep']),
+            'rang': dict(et['rang']), 'prog': dict(et['prog'])
+        }
+
+
+def live_envoyer(force=False):
+    """Envoie l'instantane si quelque chose a change (au plus un envoi toutes les 15 s, plus espace apres des echecs) ; un envoi de securite toutes les 5 minutes en jeu."""
+    if live_flags['absente'] or not live_flags['pret']:
+        return
+    maintenant = time.time()
+    with live_verrou:
+        sale = live_flags['sale']
+        keepalive = live_etat['en_ligne'] and maintenant - live_flags['dernier_envoi'] >= LIVE_KEEPALIVE
+        if not force:
+            if not (sale or keepalive):
+                return
+            if maintenant - live_flags['dernier_envoi'] < LIVE_INTERVALLE_ENVOI * (1 + min(live_flags['echecs'], 8)):
+                return
+        live_flags['sale'] = False
+    if not get_user_id():
+        live_flags['sale'] = True
+        live_flags['dernier_envoi'] = maintenant
+        return
+    snap = live_instantane()
+    sans_maj = dict(snap)
+    sans_maj.pop('maj', None)
+    empreinte = hashlib.md5(json.dumps(sans_maj, sort_keys=True, ensure_ascii=False).encode('utf-8')).hexdigest()
+    if empreinte == live_flags['empreinte'] and not force and not keepalive:
+        return
+    live_flags['dernier_envoi'] = maintenant
+    try:
+        res = requests.post(f"{SUPABASE_URL}/rest/v1/rpc/live_releve", headers=get_headers(), json={'p_etat': snap, 'p_debut': snap.get('debut')}, timeout=10)
+        live_trace('live_releve : %d octets -> HTTP %s %s' % (len(json.dumps(snap)), res.status_code, (res.text or '')[:160]))
+        if res.status_code in (200, 201, 204):
+            live_flags['empreinte'] = empreinte
+            live_flags['echecs'] = 0
+            return
+        if res.status_code == 404:
+            live_flags['absente'] = True      # fonction pas encore creee en base : on ne reessaie pas
+            return
+        raise RuntimeError('HTTP ' + str(res.status_code))
+    except Exception as ex:
+        live_trace('envoi en echec : %r' % (ex,))
+        live_flags['echecs'] += 1
+        live_flags['sale'] = True
+
+
+def live_boucle():
+    while True:
+        try:
+            live_envoyer()
+        except Exception as ex:
+            live_trace('boucle : %r' % (ex,))
+        time.sleep(5)
+
+
 def heartbeat_loop():
     global dernier_solde_vaisseau
     while True:
@@ -1294,6 +1678,8 @@ def plugin_start3(plugin_dir):
     threading.Thread(target=pp_scanner_journaux, daemon=True).start()
     threading.Thread(target=col_scanner_journaux, daemon=True).start()
     threading.Thread(target=bud_scanner_journaux, daemon=True).start()
+    threading.Thread(target=live_scanner_journal, daemon=True).start()
+    threading.Thread(target=live_boucle, daemon=True).start()
     return "SYS.EDTEAM"
 
 def plugin_stop():
@@ -1304,6 +1690,11 @@ def plugin_stop():
     try: bud_envoyer(force=True)
     except: pass
     try: bud_sauver_etat()
+    except: pass
+    try:
+        with live_verrou:
+            live_etat['en_ligne'] = False
+        live_envoyer(force=True)
     except: pass
 
 def plugin_app(parent):
@@ -1375,6 +1766,10 @@ def journal_entry(cmdr, is_beta, system, station, entry, state):
     # Budget : revenus et charges (aucun appel reseau ici)
     try: bud_traiter_evenement(entry)
     except Exception as e: bud_trace('evenement ignore : %r' % (e,))
+
+    # Tableau de bord en jeu : session en direct (aucun appel reseau ici)
+    try: live_traiter_evenement(entry)
+    except Exception as e: live_trace('evenement ignore : %r' % (e,))
 
     # Suivi CZ
     if not hasattr(journal_entry, 'cz_cache'):
