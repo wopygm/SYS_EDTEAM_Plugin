@@ -22,7 +22,7 @@ except ImportError:
     config = None
 
 plugin_name = "SYS.EDTEAM"
-PLUGIN_VERSION = "2.16"
+PLUGIN_VERSION = "2.17"
 
 SUPABASE_URL = "https://oailvdigfdoyfcydmabb.supabase.co"
 SUPABASE_KEY = "sb_publishable_AASqgRggHdIGttZHPGaWkA_VqrhuYNg"
@@ -1239,14 +1239,15 @@ def mettre_a_jour_interface(texte, couleur):
 LIVE_INTERVALLE_ENVOI = 30
 LIVE_INTERVALLE_MINEUR = 60     # secondes : simple changement de position (sauts), qui ne merite pas un envoi rapide
 LIVE_KEEPALIVE = 600
-LIVE_MINEURS = frozenset(('FSDJump', 'CarrierJump'))
+LIVE_MINEURS = frozenset(('FSDJump', 'CarrierJump', 'BackpackChange'))
 LIVE_REGISTRE_MAX = 30
 LIVE_MISSIONS_MAX = 40
 LIVE_TERMINEES_MAX = 30
 LIVE_EVENEMENTS = frozenset((
     'Fileheader', 'LoadGame', 'Loadout', 'Location', 'FSDJump', 'CarrierJump', 'Docked', 'Undocked',
     'MarketBuy', 'MarketSell', 'Cargo', 'MissionAccepted', 'MissionCompleted', 'MissionFailed',
-    'MissionAbandoned', 'MissionRedirected', 'Missions', 'Rank', 'Progress', 'Promotion', 'Shutdown'
+    'MissionAbandoned', 'MissionRedirected', 'Missions', 'Rank', 'Progress', 'Promotion', 'Shutdown',
+    'Disembark', 'Embark', 'SuitLoadout', 'Backpack', 'BackpackChange'
 ))
 live_re_journal = re.compile('"event":"(' + '|'.join(sorted(LIVE_EVENEMENTS)) + ')"')
 
@@ -1273,7 +1274,8 @@ def live_nouvel_etat():
         'vaisseau': {'nom': '', 'modele': '', 'cap': 0, 'saut': 0, 'cab': []},
         'paye': {},                      # marchandise -> [quantite, cout total] : prix moyen paye
         'registre': [], 'tot': {'achats': 0, 'ventes': 0, 'benef': 0, 'tonnes': 0, 'nb': 0},
-        'missions': {}, 'terminees': [], 'rep': {}, 'rang': {}, 'prog': {}
+        'missions': {}, 'terminees': [], 'rep': {}, 'rang': {}, 'prog': {},
+        'pied': {'on': False, 'suit': '', 'loadout': '', 'mods': [], 'armes': {}, 'sac': {'data': {}, 'comp': {}, 'items': {}, 'conso': {}}}     # a pied : combinaison, armes, sac a dos
     }
 
 
@@ -1310,6 +1312,55 @@ def live_cabines(modules):
         return []
     res.sort(key=lambda c: (-c[0], -c[1]))
     return res
+
+
+# a pied (Odyssey) : combinaison, armes et sac a dos. Le jeu ne donne PAS les outils equipes ni la capacite du sac.
+LIVE_SAC_TYPES = {'item': 'items', 'component': 'comp', 'consumable': 'conso', 'data': 'data'}
+
+
+def live_costume(e):
+    p = live_etat['pied']
+    p['suit'] = str(e.get('SuitName') or '').lower()
+    p['loadout'] = live_texte(e.get('LoadoutName'))
+    p['mods'] = [str(x) for x in (e.get('SuitMods') or [])][:12]
+    armes = {}
+    cles = {'PrimaryWeapon1': 'p1', 'PrimaryWeapon2': 'p2', 'SecondaryWeapon': 's'}
+    for mod in (e.get('Modules') or []):
+        k = cles.get(str(mod.get('SlotName') or ''))
+        if k:
+            armes[k] = {'n': live_texte(mod.get('ModuleName_Localised') or mod.get('ModuleName')), 'c': _bn(mod.get('Class')),
+                        'm': [str(x) for x in (mod.get('WeaponMods') or [])][:8]}
+    p['armes'] = armes
+
+
+def live_sac_complet(e):
+    """Contenu complet du sac a dos (evenement Backpack ; si l'evenement est vide, on lit Backpack.json)."""
+    src = e
+    if not any(k in e for k in ('Items', 'Components', 'Consumables', 'Data')):
+        src = live_lire_fichier('Backpack.json') or {}
+    sac = {'data': {}, 'comp': {}, 'items': {}, 'conso': {}}
+    for cle, cat in (('Items', 'items'), ('Components', 'comp'), ('Consumables', 'conso'), ('Data', 'data')):
+        for it in (src.get(cle) or []):
+            nom = live_texte(it.get('Name_Localised') or it.get('Name'))
+            n = _bn(it.get('Count'))
+            if nom and n > 0:
+                sac[cat][nom] = sac[cat].get(nom, 0) + n
+    live_etat['pied']['sac'] = sac
+
+
+def live_sac_change(e):
+    sac = live_etat['pied']['sac']
+    for cle, signe in (('Added', 1), ('Removed', -1)):
+        for it in (e.get(cle) or []):
+            cat = LIVE_SAC_TYPES.get(str(it.get('Type') or '').lower())
+            nom = live_texte(it.get('Name_Localised') or it.get('Name'))
+            if not cat or not nom:
+                continue
+            n = sac[cat].get(nom, 0) + signe * _bn(it.get('Count'))
+            if n > 0:
+                sac[cat][nom] = n
+            else:
+                sac[cat].pop(nom, None)
 
 
 def live_type_mission(nom):
@@ -1356,7 +1407,21 @@ def live_appliquer(e):
         except Exception:
             pass
         et['vaisseau']['cab'] = live_cabines(e.get('Modules'))                         # cabines de passagers : [[classe, places], ...]
+    elif ev == 'Disembark':
+        live_etat['pied']['on'] = True      # on descend (du vaisseau, du SRV, d'un taxi ou d'un equipage) : a pied dans tous les cas
+    elif ev == 'Embark':
+        live_etat['pied']['on'] = False
+    elif ev == 'SuitLoadout':
+        live_costume(e)
+    elif ev == 'Backpack':
+        live_sac_complet(e)
+    elif ev == 'BackpackChange':
+        live_sac_change(e)
     elif ev in ('Location', 'FSDJump', 'CarrierJump'):
+        if ev == 'Location' and 'OnFoot' in e:
+            et['pied']['on'] = bool(e.get('OnFoot'))
+        elif ev != 'Location':
+            et['pied']['on'] = False
         if e.get('StarSystem'):
             et['systeme'] = live_texte(e.get('StarSystem'))
         if isinstance(e.get('StarPos'), list) and len(e.get('StarPos')) == 3:
@@ -1372,6 +1437,7 @@ def live_appliquer(e):
     elif ev == 'Undocked':
         et['amarre'] = False
         et['station'] = ''
+        et['pied']['on'] = False
     elif ev == 'MarketBuy':
         q = _bn(e.get('Count'))
         cout = _bn(e.get('TotalCost'))
@@ -1566,6 +1632,15 @@ def live_lire_fichier(nom):
     return None
 
 
+def live_pied_instantane(p):
+    """Etat a pied pour l'instantane : seulement quand on est a pied (sinon un simple indicateur), sac en listes [[nom, nombre], ...]."""
+    if not p.get('on'):
+        return {'on': False}
+    return {'on': True, 'suit': p.get('suit', ''), 'loadout': p.get('loadout', ''), 'mods': list(p.get('mods') or []),
+            'armes': dict(p.get('armes') or {}),
+            'sac': {cat: sorted([[n, q] for n, q in (p.get('sac', {}).get(cat) or {}).items()], key=lambda x: x[0]) for cat in ('data', 'comp', 'items', 'conso')}}
+
+
 def live_instantane():
     """Construit l'instantane envoye au serveur (aucun appel reseau). La soute vient de Cargo.json, les credits de Status.json."""
     cargo = live_lire_fichier('Cargo.json') or {}
@@ -1592,7 +1667,7 @@ def live_instantane():
             'soute': {'cap': et['vaisseau'].get('cap') or 0, 'items': items},
             'registre': list(et['registre']), 'tot': dict(et['tot']),
             'missions': missions, 'terminees': list(et['terminees']), 'rep': dict(et['rep']),
-            'rang': dict(et['rang']), 'prog': dict(et['prog'])
+            'rang': dict(et['rang']), 'prog': dict(et['prog']), 'pied': live_pied_instantane(et['pied'])
         }
 
 
