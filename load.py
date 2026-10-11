@@ -22,7 +22,7 @@ except ImportError:
     config = None
 
 plugin_name = "SYS.EDTEAM"
-PLUGIN_VERSION = "2.17"
+PLUGIN_VERSION = "2.18"
 
 SUPABASE_URL = "https://oailvdigfdoyfcydmabb.supabase.co"
 SUPABASE_KEY = "sb_publishable_AASqgRggHdIGttZHPGaWkA_VqrhuYNg"
@@ -1271,7 +1271,7 @@ def live_trace(msg):
 def live_nouvel_etat():
     return {
         'debut': None, 'en_ligne': False, 'systeme': '', 'station': '', 'amarre': False, 'pos': None,
-        'vaisseau': {'nom': '', 'modele': '', 'cap': 0, 'saut': 0, 'cab': []},
+        'vaisseau': {'nom': '', 'modele': '', 'cap': 0, 'saut': 0, 'cab': [], 'mods': []},
         'paye': {},                      # marchandise -> [quantite, cout total] : prix moyen paye
         'registre': [], 'tot': {'achats': 0, 'ventes': 0, 'benef': 0, 'tonnes': 0, 'nb': 0},
         'missions': {}, 'terminees': [], 'rep': {}, 'rang': {}, 'prog': {},
@@ -1303,11 +1303,13 @@ def live_cabines(modules):
     res = []
     try:
         for mod in (modules or []):
-            m = re.match(r'^int_passengercabin_size([0-9])_class([0-9])$', str(mod.get('Item') or '').lower())
+            m = re.match(r'^int_(mkii_)?passengercabin_size([0-9])_class([0-9])$', str(mod.get('Item') or '').lower())
             if m:
-                places = LIVE_CABINES.get((int(m.group(1)), int(m.group(2))))
+                places = LIVE_CABINES.get((int(m.group(2)), int(m.group(3))))
                 if places:
-                    res.append([int(m.group(2)), places])
+                    if m.group(1):
+                        places = int(places * 1.5)
+                    res.append([int(m.group(3)), places])
     except Exception:
         return []
     res.sort(key=lambda c: (-c[0], -c[1]))
@@ -1363,6 +1365,33 @@ def live_sac_change(e):
                 sac[cat].pop(nom, None)
 
 
+# modules du vaisseau (Loadout) : emplacement, module, allume, niveau d'ingenierie ; detail (plan, effet, ingenieur, modifications) seulement pour les modules OPTIONNELS
+LIVE_SLOTS_IGNORES = re.compile(r'^(Decal|ShipName|ShipID|PaintJob|VesselVoice|Bobble|Nameplate|WeaponColour|EngineColour|ShipKit|ShipCockpit|CargoHatch|Hologram)')
+LIVE_SLOTS_OPTIONNELS = re.compile(r'^(Slot[0-9]+_Size[0-9]+|Military[0-9]+|Passenger[0-9]+|Cargo[0-9]+|PlanetaryApproachSuite)$')
+
+
+def live_modules(modules):
+    res = []
+    try:
+        for mod in (modules or []):
+            slot = str(mod.get('Slot') or '')
+            if not slot or LIVE_SLOTS_IGNORES.match(slot):
+                continue
+            o = {'s': slot, 'i': str(mod.get('Item') or '').lower(), 'o': 1 if mod.get('On', True) else 0}
+            g = mod.get('Engineering')
+            if isinstance(g, dict):
+                o['g'] = int(g.get('Level') or 0)
+                if LIVE_SLOTS_OPTIONNELS.match(slot):
+                    o['b'] = str(g.get('BlueprintName') or '')
+                    o['x'] = str(g.get('ExperimentalEffect') or '')
+                    o['e'] = live_texte(g.get('Engineer'))
+                    o['m'] = [[str(x.get('Label') or ''), round(float(x.get('OriginalValue') or 0), 3), round(float(x.get('Value') or 0), 3), 1 if x.get('LessIsGood') else 0] for x in (g.get('Modifiers') or [])][:10]
+            res.append(o)
+    except Exception:
+        return []
+    return res[:90]
+
+
 def live_type_mission(nom):
     n = str(nom or '').lower()
     for cle, mot in (('don', 'altruism'), ('passagers', 'passenger'), ('courrier', 'courier'), ('collecte', 'collect'), ('livraison', 'delivery'),
@@ -1407,6 +1436,7 @@ def live_appliquer(e):
         except Exception:
             pass
         et['vaisseau']['cab'] = live_cabines(e.get('Modules'))                         # cabines de passagers : [[classe, places], ...]
+        et['vaisseau']['mods'] = live_modules(e.get('Modules'))                        # modules du vaisseau (hologramme)
     elif ev == 'Disembark':
         live_etat['pied']['on'] = True      # on descend (du vaisseau, du SRV, d'un taxi ou d'un equipage) : a pied dans tous les cas
     elif ev == 'Embark':
