@@ -1414,7 +1414,7 @@ def live_appliquer(e):
             'id': mid, 'nom': live_texte(e.get('LocalisedName')), 'type': live_type_mission(nom), 'faction': live_texte(e.get('Faction')),
             'sys': live_texte(e.get('DestinationSystem')), 'st': live_texte(e.get('DestinationStation')), 'exp': e.get('Expiry'),
             'rec': e.get('Reward'), 'q': _bn(e.get('Count')), 'march': live_texte(e.get('Commodity_Localised')), 'pas': _bn(e.get('PassengerCount')),
-            'vip': 1 if e.get('PassengerVIPs') else 0, 'rech': 1 if e.get('PassengerWanted') else 0,
+            'vip': 1 if e.get('PassengerVIPs') else 0, 'rech': 1 if e.get('PassengerWanted') else 0, 'ptype': live_texte(e.get('PassengerType')),
             'don': _bn(e.get('Donation')), 'inf': e.get('Influence'), 'rep': e.get('Reputation'), 't': ts,
             'os': et['systeme'], 'ost': et['station']     # ou la mission a ete prise (pour le retour au commanditaire)
         }
