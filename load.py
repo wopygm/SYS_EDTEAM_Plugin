@@ -22,7 +22,7 @@ except ImportError:
     config = None
 
 plugin_name = "SYS.EDTEAM"
-PLUGIN_VERSION = "2.15"
+PLUGIN_VERSION = "2.16"
 
 SUPABASE_URL = "https://oailvdigfdoyfcydmabb.supabase.co"
 SUPABASE_KEY = "sb_publishable_AASqgRggHdIGttZHPGaWkA_VqrhuYNg"
@@ -1270,7 +1270,7 @@ def live_trace(msg):
 def live_nouvel_etat():
     return {
         'debut': None, 'en_ligne': False, 'systeme': '', 'station': '', 'amarre': False, 'pos': None,
-        'vaisseau': {'nom': '', 'modele': '', 'cap': 0, 'saut': 0},
+        'vaisseau': {'nom': '', 'modele': '', 'cap': 0, 'saut': 0, 'cab': []},
         'paye': {},                      # marchandise -> [quantite, cout total] : prix moyen paye
         'registre': [], 'tot': {'achats': 0, 'ventes': 0, 'benef': 0, 'tonnes': 0, 'nb': 0},
         'missions': {}, 'terminees': [], 'rep': {}, 'rang': {}, 'prog': {}
@@ -1289,6 +1289,27 @@ def live_ts(ts):
 
 def live_texte(s):
     return str(s or '').replace('&nbsp;', ' ').replace(chr(160), ' ').strip()
+
+
+# places par cabine de passagers : (taille, classe) -> places (donnees Coriolis : classe 1 = Eco, 2 = Affaires, 3 = Premiere, 4 = Luxe)
+LIVE_CABINES = {(2, 1): 2, (3, 1): 4, (4, 1): 8, (5, 1): 16, (6, 1): 32, (3, 2): 3, (4, 2): 6, (5, 2): 10, (6, 2): 16,
+                (4, 3): 3, (5, 3): 6, (6, 3): 12, (5, 4): 4, (6, 4): 8}
+
+
+def live_cabines(modules):
+    """Liste des cabines de passagers du vaisseau, [[classe, places], ...], de la classe la plus haute a la plus basse (cabine inconnue = ignoree)."""
+    res = []
+    try:
+        for mod in (modules or []):
+            m = re.match(r'^int_passengercabin_size([0-9])_class([0-9])$', str(mod.get('Item') or '').lower())
+            if m:
+                places = LIVE_CABINES.get((int(m.group(1)), int(m.group(2))))
+                if places:
+                    res.append([int(m.group(2)), places])
+    except Exception:
+        return []
+    res.sort(key=lambda c: (-c[0], -c[1]))
+    return res
 
 
 def live_type_mission(nom):
@@ -1334,6 +1355,7 @@ def live_appliquer(e):
             et['vaisseau']['saut'] = round(float(e.get('MaxJumpRange') or 0), 1)      # portee de saut a vide : sert a regler la feuille de route
         except Exception:
             pass
+        et['vaisseau']['cab'] = live_cabines(e.get('Modules'))                         # cabines de passagers : [[classe, places], ...]
     elif ev in ('Location', 'FSDJump', 'CarrierJump'):
         if e.get('StarSystem'):
             et['systeme'] = live_texte(e.get('StarSystem'))
@@ -1392,6 +1414,7 @@ def live_appliquer(e):
             'id': mid, 'nom': live_texte(e.get('LocalisedName')), 'type': live_type_mission(nom), 'faction': live_texte(e.get('Faction')),
             'sys': live_texte(e.get('DestinationSystem')), 'st': live_texte(e.get('DestinationStation')), 'exp': e.get('Expiry'),
             'rec': e.get('Reward'), 'q': _bn(e.get('Count')), 'march': live_texte(e.get('Commodity_Localised')), 'pas': _bn(e.get('PassengerCount')),
+            'vip': 1 if e.get('PassengerVIPs') else 0, 'rech': 1 if e.get('PassengerWanted') else 0,
             'don': _bn(e.get('Donation')), 'inf': e.get('Influence'), 'rep': e.get('Reputation'), 't': ts,
             'os': et['systeme'], 'ost': et['station']     # ou la mission a ete prise (pour le retour au commanditaire)
         }
