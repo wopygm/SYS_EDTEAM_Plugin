@@ -22,7 +22,7 @@ except ImportError:
     config = None
 
 plugin_name = "SYS.EDTEAM"
-PLUGIN_VERSION = "2.22"
+PLUGIN_VERSION = "2.23"
 
 SUPABASE_URL = "https://oailvdigfdoyfcydmabb.supabase.co"
 SUPABASE_KEY = "sb_publishable_AASqgRggHdIGttZHPGaWkA_VqrhuYNg"
@@ -463,6 +463,7 @@ COL_LOT_SYSTEMES = 40
 COL_LOT_LIVRAISONS = 400
 COL_LOT_INSTALLATIONS = 100
 COL_MARQUEUR = 'col_marqueur.json'
+COL_RELECTURE_COMPLETE = '2.23'     # a changer pour obliger tous les plugins a relire une fois tous leurs journaux
 COL_ECHECS_MAX = 5
 
 col_verrou = threading.Lock()
@@ -548,6 +549,11 @@ def col_traiter_evenement(entry):
     if ev == 'ColonisationSystemClaim':
         adr = entry.get('SystemAddress')
         nom = entry.get('StarSystem')
+        if adr and not nom:
+            nom = (col_positions.get(adr) or {}).get('nom')            # evenement sans nom de systeme : on reprend celui vu aux sauts
+        elif nom and not adr:
+            adr = next((a for a, p_ in col_positions.items() if p_.get('nom') == nom), None)
+        col_trace('revendication vue : %s | systeme=%s adresse=%s | champs=%s' % (ts, nom, adr, ','.join(sorted(entry.keys()))))
         if adr and nom:
             p = col_positions.get(adr) or {}
             with col_verrou:
@@ -604,7 +610,10 @@ def col_traiter_evenement(entry):
 def col_lire_marqueur():
     try:
         with open(col_chemin(COL_MARQUEUR), 'r', encoding='utf-8') as f:
-            return json.load(f).get('dernier_ts') or ''
+            d = json.load(f)
+        if d.get('rel') != COL_RELECTURE_COMPLETE:
+            return ''          # marqueur d'une version precedente : une relecture complete est refaite une fois (le serveur ignore les doublons)
+        return d.get('dernier_ts') or ''
     except Exception:
         return ''
 
@@ -613,7 +622,7 @@ def col_ecrire_marqueur(ts):
         return
     try:
         with open(col_chemin(COL_MARQUEUR), 'w', encoding='utf-8') as f:
-            json.dump({'dernier_ts': ts}, f)
+            json.dump({'dernier_ts': ts, 'rel': COL_RELECTURE_COMPLETE}, f)
     except Exception:
         pass
 
