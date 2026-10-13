@@ -22,7 +22,7 @@ except ImportError:
     config = None
 
 plugin_name = "SYS.EDTEAM"
-PLUGIN_VERSION = "2.21"
+PLUGIN_VERSION = "2.22"
 
 SUPABASE_URL = "https://oailvdigfdoyfcydmabb.supabase.co"
 SUPABASE_KEY = "sb_publishable_AASqgRggHdIGttZHPGaWkA_VqrhuYNg"
@@ -95,6 +95,17 @@ def trouver_journal_dir():
         except Exception:
             pass
     return candidats[0] if candidats else None
+
+def lister_journaux(jdir):
+    """Fichiers Journal.*.log du dossier, du plus ancien au plus recent d'apres leur DATE DE MODIFICATION (puis le nom).
+    Le tri par nom seul est faux quand un dossier contient d'anciens journaux au vieux format (Journal.220207204012.01.log) : ils passent apres
+    les noms recents (Journal.2026-10-13T204012.01.log) et le plugin lisait alors une vieille session terminee (jeu 'non lance')."""
+    def _cle(f):
+        try:
+            return (os.path.getmtime(os.path.join(jdir, f)), f)
+        except OSError:
+            return (0, f)
+    return sorted((f for f in os.listdir(jdir) if f.startswith('Journal.') and f.endswith('.log') and f.count('.') >= 3), key=_cle)
 
 def lire_cle():
     try:
@@ -488,6 +499,12 @@ def col_maj_ts(ts):
     if ts and str(ts) > col_etat['dernier_ts']:
         col_etat['dernier_ts'] = str(ts)
 
+def col_nom_faction(v):
+    """Nom d'une faction : un objet {'Name': ...} aujourd'hui, mais une simple chaine dans les anciens journaux (2022)."""
+    if isinstance(v, dict):
+        return v.get('Name')
+    return v if isinstance(v, str) and v else None
+
 def col_traiter_evenement(entry):
     """Traite UN evenement de journal. Ne fait aucun appel reseau."""
     ev = entry.get('event')
@@ -502,7 +519,7 @@ def col_traiter_evenement(entry):
             if isinstance(pos, (list, tuple)) and len(pos) == 3:
                 x, y, z = pos[0], pos[1], pos[2]
             col_positions[adr] = {'nom': nom, 'x': x, 'y': y, 'z': z,
-                                  'faction': (entry.get('SystemFaction') or {}).get('Name'), 'faction_ts': ts}
+                                  'faction': col_nom_faction(entry.get('SystemFaction')), 'faction_ts': ts}
             col_courant['adresse'] = adr
             col_courant['nom'] = nom
         for f_ in (entry.get('Factions') or []):
@@ -518,7 +535,7 @@ def col_traiter_evenement(entry):
         if mid and ('ConstructionDepot' in typ or 'ColonisationShip' in nom_st or 'Construction Site' in nom_st):
             col_stations[mid] = {'station': nom_st, 'type': typ, 'systeme': entry.get('StarSystem'), 'adresse': entry.get('SystemAddress')}
         elif (mid and col_faction['nom'] and typ != 'FleetCarrier' and not nom_st.startswith('$') and entry.get('SystemAddress')
-              and mid not in col_inst_envoyees and (entry.get('StationFaction') or {}).get('Name') == col_faction['nom']):
+              and mid not in col_inst_envoyees and col_nom_faction(entry.get('StationFaction')) == col_faction['nom']):
             # Station terminee de la faction de l'escadron : simple CANDIDATE. Le serveur (col_installations, SQL 24) ne la retient que si le
             # systeme est deja connu comme colonise (revendication ou chantier vu) ; les systemes BGS classiques sont jetes la-bas.
             with col_verrou:
@@ -751,6 +768,8 @@ def col_scanner_journaux():
                     try:
                         e = json.loads(ligne)
                     except Exception:
+                        continue
+                    if not isinstance(e, dict):
                         continue
                     col_traiter_evenement(e)
                     nb += 1
@@ -1825,6 +1844,8 @@ def live_lire_morceau(chemin, debut):
             e = json.loads(ligne)
         except Exception:
             continue
+        if not isinstance(e, dict):
+            continue
         live_traiter_evenement(e)
         nb += 1
     if nb:
@@ -1838,7 +1859,7 @@ def live_suivre():
     jdir = trouver_journal_dir()
     if not jdir or not os.path.isdir(jdir):
         return
-    fichiers = sorted(f for f in os.listdir(jdir) if f.startswith('Journal.') and f.endswith('.log') and f.count('.') >= 3)
+    fichiers = lister_journaux(jdir)
     if not fichiers:
         return
     dernier = fichiers[-1]
@@ -2157,7 +2178,7 @@ def bgs_reconstituer_missions(missions):
     jdir = trouver_journal_dir()
     if not jdir or not os.path.isdir(jdir):
         return
-    fichiers = sorted(f for f in os.listdir(jdir) if f.startswith('Journal.') and f.endswith('.log') and f.count('.') >= 3)
+    fichiers = lister_journaux(jdir)
     if not fichiers:
         return
     prefixe = fichiers[-1].split('.')[1]
