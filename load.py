@@ -22,7 +22,7 @@ except ImportError:
     config = None
 
 plugin_name = "SYS.EDTEAM"
-PLUGIN_VERSION = "2.18"
+PLUGIN_VERSION = "2.19"
 
 SUPABASE_URL = "https://oailvdigfdoyfcydmabb.supabase.co"
 SUPABASE_KEY = "sb_publishable_AASqgRggHdIGttZHPGaWkA_VqrhuYNg"
@@ -1239,7 +1239,7 @@ def mettre_a_jour_interface(texte, couleur):
 LIVE_INTERVALLE_ENVOI = 30
 LIVE_INTERVALLE_MINEUR = 60     # secondes : simple changement de position (sauts), qui ne merite pas un envoi rapide
 LIVE_KEEPALIVE = 600
-LIVE_MINEURS = frozenset(('FSDJump', 'CarrierJump', 'BackpackChange'))
+LIVE_MINEURS = frozenset(('FSDJump', 'CarrierJump', 'BackpackChange', 'MiningRefined', 'ProspectedAsteroid', 'LaunchDrone', 'SAASignalsFound'))
 LIVE_REGISTRE_MAX = 30
 LIVE_MISSIONS_MAX = 40
 LIVE_TERMINEES_MAX = 30
@@ -1247,7 +1247,8 @@ LIVE_EVENEMENTS = frozenset((
     'Fileheader', 'LoadGame', 'Loadout', 'Location', 'FSDJump', 'CarrierJump', 'Docked', 'Undocked',
     'MarketBuy', 'MarketSell', 'Cargo', 'MissionAccepted', 'MissionCompleted', 'MissionFailed',
     'MissionAbandoned', 'MissionRedirected', 'Missions', 'Rank', 'Progress', 'Promotion', 'Shutdown',
-    'Disembark', 'Embark', 'SuitLoadout', 'Backpack', 'BackpackChange'
+    'Disembark', 'Embark', 'SuitLoadout', 'Backpack', 'BackpackChange',
+    'LaunchSRV', 'DockSRV', 'SRVDestroyed', 'MiningRefined', 'ProspectedAsteroid', 'LaunchDrone', 'CargoTransfer', 'SAASignalsFound'
 ))
 live_re_journal = re.compile('"event":"(' + '|'.join(sorted(LIVE_EVENEMENTS)) + ')"')
 
@@ -1268,6 +1269,151 @@ def live_trace(msg):
         pass
 
 
+LIVE_RHINO_CAP = 72     # emplacements de la soute du Rhino (le journal ne donne pas la capacite d'un VRS : valeur constatee en jeu)
+
+
+def live_minage_neuf():
+    """Etat du minage de la session : soute du Rhino (minerais raffines depuis le dernier transfert), totaux par mode, dernier asteroide prospecte, drones."""
+    return {'srv': '', 'rhino': {'det': {}, 'cap': LIVE_RHINO_CAP, 'dt': None}, 'tot': {'rhino': {}, 'vaisseau': {}}, 'deb': {}, 'fin': {}, 'noms': {}, 'pros': None, 'dr': {}, 'sig': {}, 'hot': {}}
+
+
+def live_cle_minerai(t):
+    """'$osmium_name;' -> 'osmium' (meme cle que les transferts de soute et les ventes)."""
+    s = str(t or '').strip().lower()
+    if s.startswith('$'):
+        s = s[1:]
+    if s.endswith('_name;'):
+        s = s[:-6]
+    return s
+
+
+def live_minage_mode(m):
+    return 'rhino' if 'rhino' in str(m.get('srv') or '') else 'vaisseau'
+
+
+def live_minage_raffine(e):
+    """Un minerai raffine (un evenement par unite) : au Rhino s'il est sorti, sinon au vaisseau."""
+    m = live_etat['minage']
+    k = live_cle_minerai(e.get('Type'))
+    if not k:
+        return
+    ts = str(e.get('timestamp') or '')
+    if len(m['noms']) < 40:
+        m['noms'][k] = live_texte(e.get('Type_Localised') or k)
+    mode = live_minage_mode(m)
+    tot = m['tot'][mode]
+    tot[k] = tot.get(k, 0) + 1
+    if mode not in m['deb']:
+        m['deb'][mode] = ts
+    m['fin'][mode] = ts
+    if mode == 'rhino':
+        det = m['rhino']['det']
+        det[k] = det.get(k, 0) + 1
+
+
+def live_minage_transfert(e):
+    """Transfert de soute entre le VRS et le vaisseau : 'toship' vide le Rhino, 'tosrv' le remplit."""
+    m = live_etat['minage']
+    det = m['rhino']['det']
+    change = False
+    for tr in (e.get('Transfers') or []):
+        k = live_cle_minerai(tr.get('Type'))
+        n = _bn(tr.get('Count'))
+        sens = str(tr.get('Direction') or '').lower()
+        if not k or n <= 0:
+            continue
+        if sens == 'toship':
+            det[k] = det.get(k, 0) - n
+            change = True
+        elif sens == 'tosrv':
+            det[k] = det.get(k, 0) + n
+            change = True
+    for k in [k for k, v in det.items() if v <= 0]:
+        del det[k]
+    if change:
+        m['rhino']['dt'] = str(e.get('timestamp') or '')
+
+
+def live_soute_transfert(e):
+    """Un transfert VRS <-> vaisseau change la soute du VAISSEAU, mais Cargo.json ne decrit que le VRS tant qu'on est dedans : on tient donc la soute du vaisseau a jour ici."""
+    et = live_etat
+    sv = et.get('soute_vaisseau') or {'Vessel': 'Ship', 'Inventory': []}
+    inv = {}
+    for i in (sv.get('Inventory') or []):
+        inv[str(i.get('Name') or '').lower()] = dict(i)
+    noms = et['minage']['noms']
+    for tr in (e.get('Transfers') or []):
+        k = live_cle_minerai(tr.get('Type'))
+        n = _bn(tr.get('Count'))
+        sens = str(tr.get('Direction') or '').lower()
+        if not k or n <= 0:
+            continue
+        it = inv.get(k)
+        if it is None:
+            it = {'Name': k, 'Name_Localised': noms.get(k) or k.capitalize(), 'Count': 0}
+            inv[k] = it
+        if sens == 'toship':
+            it['Count'] = _bn(it.get('Count')) + n
+        elif sens == 'tosrv':
+            it['Count'] = _bn(it.get('Count')) - n
+    et['soute_vaisseau'] = {'Vessel': 'Ship', 'Inventory': [v for v in inv.values() if _bn(v.get('Count')) > 0]}
+
+
+def live_minage_signaux(e):
+    """Scan de surface d'un corps (SAASignalsFound) : nombre d'emplacements d'extraction planetaire du corps."""
+    nom = live_texte(e.get('BodyName'))
+    if not nom:
+        return
+    if nom.endswith(' Ring'):
+        # anneau scanne : points chauds = [[minerai (nom anglais), nombre], ...] (les signaux $SAA_... ne sont pas des minerais)
+        hot = []
+        for s in (e.get('Signals') or []):
+            t = str(s.get('Type') or '')
+            if t and not t.startswith('$') and _bn(s.get('Count')) > 0:
+                hot.append([t, _bn(s.get('Count'))])
+        hots = live_etat['minage']['hot']
+        if hot:
+            hots[nom] = hot[:12]
+            if len(hots) > 24:
+                del hots[next(iter(hots))]
+        return
+    n = 0
+    for s in (e.get('Signals') or []):
+        if 'PlanetaryMiningLocation' in str(s.get('Type') or ''):
+            n = max(n, _bn(s.get('Count')))
+    sig = live_etat['minage']['sig']
+    if n > 0:
+        sig[nom] = n
+        if len(sig) > 60:
+            del sig[next(iter(sig))]
+
+
+def live_minage_prospecte(e):
+    """Dernier asteroide prospecte (vaisseau) : composition, richesse, matiere de noyau eventuelle."""
+    mats = []
+    for x in (e.get('Materials') or [])[:8]:
+        try:
+            mats.append([live_texte(x.get('Name_Localised') or x.get('Name')), round(float(x.get('Proportion') or 0), 1)])
+        except Exception:
+            pass
+    try:
+        reste = int(round(float(e.get('Remaining') or 0)))
+    except Exception:
+        reste = 0
+    live_etat['minage']['pros'] = {'t': str(e.get('timestamp') or ''), 'mat': mats, 'ct': live_texte(e.get('Content_Localised') or e.get('Content')),
+                                   'reste': reste, 'coeur': live_texte(e.get('MotherlodeMaterial_Localised') or e.get('MotherlodeMaterial'))}
+
+
+def live_minage_instantane(m):
+    """Minage pour l'instantane : rien (None) tant qu'on n'a pas mine, pour ne pas alourdir l'envoi."""
+    if not (m.get('deb') or m['rhino']['det'] or m.get('pros') or m.get('dr') or m.get('sig') or m.get('hot')):
+        return None
+    return {'srv': 1 if live_minage_mode(m) == 'rhino' and m.get('srv') else 0,
+            'rhino': {'det': dict(m['rhino']['det']), 'cap': m['rhino']['cap'], 'dt': m['rhino']['dt']},
+            'tot': {'rhino': dict(m['tot']['rhino']), 'vaisseau': dict(m['tot']['vaisseau'])},
+            'deb': dict(m['deb']), 'fin': dict(m['fin']), 'noms': dict(m['noms']), 'pros': m.get('pros'), 'dr': dict(m['dr']), 'sig': dict(m.get('sig') or {}), 'hot': dict(m.get('hot') or {})}
+
+
 def live_nouvel_etat():
     return {
         'debut': None, 'en_ligne': False, 'systeme': '', 'station': '', 'amarre': False, 'pos': None,
@@ -1275,7 +1421,8 @@ def live_nouvel_etat():
         'paye': {},                      # marchandise -> [quantite, cout total] : prix moyen paye
         'registre': [], 'tot': {'achats': 0, 'ventes': 0, 'benef': 0, 'tonnes': 0, 'nb': 0},
         'missions': {}, 'terminees': [], 'rep': {}, 'rang': {}, 'prog': {},
-        'pied': {'on': False, 'suit': '', 'loadout': '', 'mods': [], 'armes': {}, 'sac': {'data': {}, 'comp': {}, 'items': {}, 'conso': {}}}     # a pied : combinaison, armes, sac a dos
+        'pied': {'on': False, 'suit': '', 'loadout': '', 'mods': [], 'armes': {}, 'sac': {'data': {}, 'comp': {}, 'items': {}, 'conso': {}}},     # a pied : combinaison, armes, sac a dos
+        'minage': live_minage_neuf()
     }
 
 
@@ -1437,6 +1584,29 @@ def live_appliquer(e):
             pass
         et['vaisseau']['cab'] = live_cabines(e.get('Modules'))                         # cabines de passagers : [[classe, places], ...]
         et['vaisseau']['mods'] = live_modules(e.get('Modules'))                        # modules du vaisseau (hologramme)
+    elif ev == 'LaunchSRV':
+        et['minage']['srv'] = str(e.get('SRVType') or '').lower()
+    elif ev in ('DockSRV', 'SRVDestroyed'):
+        et['minage']['srv'] = ''
+        if ev == 'SRVDestroyed':
+            et['minage']['rhino']['det'] = {}
+    elif ev == 'MiningRefined':
+        live_minage_raffine(e)
+    elif ev == 'ProspectedAsteroid':
+        live_minage_prospecte(e)
+    elif ev == 'SAASignalsFound':
+        live_minage_signaux(e)
+    elif ev == 'LaunchDrone':
+        d = live_texte(e.get('Type')) or '?'
+        et['minage']['dr'][d] = et['minage']['dr'].get(d, 0) + 1
+    elif ev == 'CargoTransfer':
+        live_minage_transfert(e)
+        live_soute_transfert(e)
+    elif ev == 'Cargo':
+        if str(e.get('Vessel') or '').upper() == 'SRV' and _bn(e.get('Count')) == 0:
+            et['minage']['rhino']['det'] = {}       # soute du VRS vide (transferee, jetee ou perdue)
+        elif str(e.get('Vessel') or 'Ship').upper() != 'SRV' and isinstance(e.get('Inventory'), list):
+            et['soute_vaisseau'] = {'Vessel': 'Ship', 'Inventory': e.get('Inventory')}
     elif ev == 'Disembark':
         live_etat['pied']['on'] = True      # on descend (du vaisseau, du SRV, d'un taxi ou d'un equipage) : a pied dans tous les cas
     elif ev == 'Embark':
@@ -1678,6 +1848,11 @@ def live_instantane():
     with live_verrou:
         et = live_etat
         items = []
+        # Cargo.json contient la soute du VRS quand on est dans le VRS (Vessel = SRV) : on envoie alors la derniere soute connue du VAISSEAU
+        if str(cargo.get('Vessel') or 'Ship').upper() == 'SRV':
+            cargo = et.get('soute_vaisseau') or {}
+        elif cargo:
+            et['soute_vaisseau'] = cargo
         for it in (cargo.get('Inventory') or []):
             cle = str(it.get('Name') or '').lower()
             p = et['paye'].get(cle)
@@ -1697,7 +1872,8 @@ def live_instantane():
             'soute': {'cap': et['vaisseau'].get('cap') or 0, 'items': items},
             'registre': list(et['registre']), 'tot': dict(et['tot']),
             'missions': missions, 'terminees': list(et['terminees']), 'rep': dict(et['rep']),
-            'rang': dict(et['rang']), 'prog': dict(et['prog']), 'pied': live_pied_instantane(et['pied'])
+            'rang': dict(et['rang']), 'prog': dict(et['prog']), 'pied': live_pied_instantane(et['pied']),
+            'minage': live_minage_instantane(et['minage'])
         }
 
 
