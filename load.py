@@ -22,7 +22,7 @@ except ImportError:
     config = None
 
 plugin_name = "SYS.EDTEAM"
-PLUGIN_VERSION = "2.20"
+PLUGIN_VERSION = "2.21"
 
 SUPABASE_URL = "https://oailvdigfdoyfcydmabb.supabase.co"
 SUPABASE_KEY = "sb_publishable_AASqgRggHdIGttZHPGaWkA_VqrhuYNg"
@@ -52,12 +52,49 @@ pilot_cache = {
 }
 
 def trouver_journal_dir():
-    if config and hasattr(config, 'get'):
-        jdir = config.get('journaldir')
-        if jdir: return jdir
+    """Dossier des journaux du jeu. On demande d'abord a EDMC (reglage du pilote, puis son dossier par defaut), puis aux chemins usuels de Windows
+    (y compris un dossier Saved Games deplace dans OneDrive). Le premier qui EXISTE est retenu ; sinon on renvoie le premier candidat (comme avant).
+    NB : dans ce fichier, le nom `config` designe le MODULE config d'EDMC (l'objet de reglages est config.config) : jusqu'a la 2.20 le reglage d'EDMC
+    n'etait donc JAMAIS lu et seul le chemin par defaut de Windows etait essaye."""
+    candidats = []
+    def _ajouter(v):
+        try:
+            v = str(v).strip() if v else ''
+        except Exception:
+            v = ''
+        if v and v not in candidats:
+            candidats.append(v)
+    objets = []
+    if config:
+        objets.append(getattr(config, 'config', None))      # l'objet de reglages d'EDMC (config.config)
+        objets.append(config)                               # au cas ou `config` serait deja cet objet (ancien EDMC)
+    for cfg in objets:
+        if cfg is None:
+            continue
+        for nom in ('get_str', 'get'):
+            try:
+                if hasattr(cfg, nom):
+                    _ajouter(getattr(cfg, nom)('journaldir'))
+            except Exception:
+                pass
+        for nom in ('default_journal_dir_path', 'default_journal_dir'):
+            try:
+                _ajouter(getattr(cfg, nom, None))
+            except Exception:
+                pass
     if platform.system() == 'Windows':
-        return os.path.join(os.environ.get('USERPROFILE', ''), 'Saved Games', 'Frontier Developments', 'Elite Dangerous')
-    return None
+        _ajouter(os.path.join(os.environ.get('USERPROFILE', ''), 'Saved Games', 'Frontier Developments', 'Elite Dangerous'))
+        for var in ('OneDrive', 'OneDriveConsumer', 'OneDriveCommercial'):
+            od = os.environ.get(var)
+            if od:
+                _ajouter(os.path.join(od, 'Saved Games', 'Frontier Developments', 'Elite Dangerous'))
+    for c in candidats:
+        try:
+            if os.path.isdir(c):
+                return c
+        except Exception:
+            pass
+    return candidats[0] if candidats else None
 
 def lire_cle():
     try:
