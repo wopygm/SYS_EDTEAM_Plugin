@@ -22,7 +22,7 @@ except ImportError:
     config = None
 
 plugin_name = "SYS.EDTEAM"
-PLUGIN_VERSION = "2.25"
+PLUGIN_VERSION = "2.26"
 
 SUPABASE_URL = "https://oailvdigfdoyfcydmabb.supabase.co"
 SUPABASE_KEY = "sb_publishable_AASqgRggHdIGttZHPGaWkA_VqrhuYNg"
@@ -463,17 +463,32 @@ COL_LOT_SYSTEMES = 40
 COL_LOT_LIVRAISONS = 400
 COL_LOT_INSTALLATIONS = 100
 COL_MARQUEUR = 'col_marqueur.json'
-COL_RELECTURE_COMPLETE = '2.23'     # a changer pour obliger tous les plugins a relire une fois tous leurs journaux
+COL_RELECTURE_COMPLETE = '2.26'     # a changer pour obliger tous les plugins a relire une fois tous leurs journaux
 COL_ECHECS_MAX = 5
 
 col_verrou = threading.Lock()
-col_attente = {'chantiers': {}, 'systemes': {}, 'livraisons': [], 'installations': {}}
+col_attente = {'chantiers': {}, 'systemes': {}, 'livraisons': [], 'installations': {}, 'economies': {}}
 col_stations = {}      # MarketID -> {'station', 'type', 'systeme', 'adresse'} (vu a l'amarrage)
 col_positions = {}     # SystemAddress -> {'nom', 'x', 'y', 'z'} (vu aux sauts)
 col_courant = {'adresse': None, 'nom': None}
-col_etat = {'dernier_envoi': 0, 'rpc_absente': False, 'dernier_ts': '', 'echecs': 0, 'inst_absente': False}
+col_etat = {'dernier_envoi': 0, 'rpc_absente': False, 'dernier_ts': '', 'echecs': 0, 'inst_absente': False, 'eco_absente': False}
 col_faction = {'nom': None}   # faction de l'escadron (flag SquadronFaction:true vu aux sauts)
 col_inst_envoyees = set()     # MarketID d'installations deja envoyees pendant cette session
+col_eco_envoyees = {}         # MarketID -> economies (texte JSON) deja envoyees pendant cette session
+
+def col_economies_liste(entry):
+    """Economies d'une station d'apres l'evenement Docked (StationEconomies) : [[nom, proportion], ...], les plus fortes d'abord, 4 au plus."""
+    out = []
+    for x in (entry.get('StationEconomies') or []):
+        if isinstance(x, dict) and x.get('Name'):
+            nom = re.sub(r'[^A-Za-z]', '', str(x.get('Name')).replace('$economy_', ''))[:20]
+            try:
+                part = round(float(x.get('Proportion') or 0), 2)
+            except Exception:
+                part = 0
+            if nom:
+                out.append([nom, part])
+    return sorted(out, key=lambda a: -a[1])[:4]
 
 def col_chemin(nom):
     return os.path.join(os.path.dirname(os.path.abspath(__file__)), nom)
@@ -544,6 +559,12 @@ def col_traiter_evenement(entry):
                                                      'systeme_nom': entry.get('StarSystem'), 'nom': nom_st, 'type_station': typ, 'ts': ts,
                                                      'faction': (col_positions.get(entry.get('SystemAddress')) or {}).get('faction'),
                                                      'faction_ts': (col_positions.get(entry.get('SystemAddress')) or {}).get('faction_ts')}
+        if (mid and col_faction['nom'] and typ != 'FleetCarrier' and not nom_st.startswith('$') and 'Construction Site' not in nom_st
+                and 'ConstructionDepot' not in typ and col_nom_faction(entry.get('StationFaction')) == col_faction['nom']):
+            eco = col_economies_liste(entry)
+            if eco and col_eco_envoyees.get(mid) != json.dumps(eco):
+                with col_verrou:
+                    col_attente['economies'][mid] = {'market_id': mid, 'economies': eco}
         return
 
     if ev == 'ColonisationSystemClaim':
@@ -662,12 +683,48 @@ def col_envoyer_installations(installations):
         col_trace('installations : envoi en echec : %r' % (e,))
         _rearmer_i(installations[i_i:])
 
+def col_envoyer_economies(stations):
+    """Economie des stations terminees (fonction col_economies, SQL 88) : indice pour identifier le type d'un avant-poste. Remises en attente si l'envoi echoue."""
+    if not stations or col_etat['eco_absente']:
+        return
+    def _rearmer_e(lst):
+        with col_verrou:
+            for x in lst:
+                if x['market_id'] not in col_attente['economies']:
+                    col_attente['economies'][x['market_id']] = x
+    if not get_user_id():
+        _rearmer_e(stations)
+        return
+    i_e = 0
+    try:
+        while i_e < len(stations):
+            lot_e = stations[i_e:i_e + COL_LOT_INSTALLATIONS]
+            res = requests.post(
+                f"{SUPABASE_URL}/rest/v1/rpc/col_economies",
+                headers=get_headers(),
+                json={'p_stations': lot_e},
+                timeout=20
+            )
+            col_trace('col_economies : %d stations -> HTTP %s %s' % (len(lot_e), res.status_code, (res.text or '')[:160]))
+            if res.status_code in (200, 201, 204):
+                for x in lot_e:
+                    col_eco_envoyees[x['market_id']] = json.dumps(x['economies'])
+                i_e += len(lot_e)
+                continue
+            if res.status_code == 404:
+                col_etat['eco_absente'] = True      # fonction pas encore creee en base : on ne reessaie pas
+                return
+            raise RuntimeError('HTTP ' + str(res.status_code))
+    except Exception as e:
+        col_trace('economies : envoi en echec : %r' % (e,))
+        _rearmer_e(stations[i_e:])
+
 def col_envoyer(force=False):
     """Envoie ce qui est en attente, par lots. Au plus un envoi toutes les COL_INTERVALLE_ENVOI secondes, sauf force."""
     if col_etat['rpc_absente']:
         return
     with col_verrou:
-        if not (col_attente['chantiers'] or col_attente['systemes'] or col_attente['livraisons'] or col_attente['installations']):
+        if not (col_attente['chantiers'] or col_attente['systemes'] or col_attente['livraisons'] or col_attente['installations'] or col_attente['economies']):
             return
         if not force and time.time() - col_etat['dernier_envoi'] < COL_INTERVALLE_ENVOI:
             return
@@ -675,13 +732,16 @@ def col_envoyer(force=False):
         systemes = list(col_attente['systemes'].values())
         livraisons = list(col_attente['livraisons'])
         installations = list(col_attente['installations'].values())
+        economies = list(col_attente['economies'].values())
         col_attente['installations'] = {}
+        col_attente['economies'] = {}
         col_attente['chantiers'] = {}
         col_attente['systemes'] = {}
         col_attente['livraisons'] = []
         col_etat['dernier_envoi'] = time.time()
 
     col_envoyer_installations(installations)
+    col_envoyer_economies(economies)
 
     # positions connues depuis (un systeme peut etre revendique avant qu'on y saute)
     for s_ in systemes:
