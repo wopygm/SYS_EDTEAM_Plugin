@@ -22,7 +22,7 @@ except ImportError:
     config = None
 
 plugin_name = "SYS.EDTEAM"
-PLUGIN_VERSION = "2.26"
+PLUGIN_VERSION = "2.27"
 
 SUPABASE_URL = "https://oailvdigfdoyfcydmabb.supabase.co"
 SUPABASE_KEY = "sb_publishable_AASqgRggHdIGttZHPGaWkA_VqrhuYNg"
@@ -463,7 +463,7 @@ COL_LOT_SYSTEMES = 40
 COL_LOT_LIVRAISONS = 400
 COL_LOT_INSTALLATIONS = 100
 COL_MARQUEUR = 'col_marqueur.json'
-COL_RELECTURE_COMPLETE = '2.26'     # a changer pour obliger tous les plugins a relire une fois tous leurs journaux
+COL_RELECTURE_COMPLETE = '2.27'     # a changer pour obliger tous les plugins a relire une fois tous leurs journaux
 COL_ECHECS_MAX = 5
 
 col_verrou = threading.Lock()
@@ -564,7 +564,7 @@ def col_traiter_evenement(entry):
             eco = col_economies_liste(entry)
             if eco and col_eco_envoyees.get(mid) != json.dumps(eco):
                 with col_verrou:
-                    col_attente['economies'][mid] = {'market_id': mid, 'economies': eco}
+                    col_attente['economies'][mid] = {'market_id': mid, 'economies': eco, 'systeme_adresse': entry.get('SystemAddress'), 'nom': nom_st}     # nom + systeme : le serveur retrouve la ligne meme si le MarketID de la station differe de celui du chantier (SQL 89)
         return
 
     if ev == 'ColonisationSystemClaim':
