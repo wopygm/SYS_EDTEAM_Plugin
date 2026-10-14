@@ -22,7 +22,7 @@ except ImportError:
     config = None
 
 plugin_name = "SYS.EDTEAM"
-PLUGIN_VERSION = "2.23"
+PLUGIN_VERSION = "2.24"
 
 SUPABASE_URL = "https://oailvdigfdoyfcydmabb.supabase.co"
 SUPABASE_KEY = "sb_publishable_AASqgRggHdIGttZHPGaWkA_VqrhuYNg"
@@ -1313,7 +1313,8 @@ LIVE_EVENEMENTS = frozenset((
     'MarketBuy', 'MarketSell', 'Cargo', 'MissionAccepted', 'MissionCompleted', 'MissionFailed',
     'MissionAbandoned', 'MissionRedirected', 'Missions', 'Rank', 'Progress', 'Promotion', 'Shutdown',
     'Disembark', 'Embark', 'SuitLoadout', 'Backpack', 'BackpackChange',
-    'LaunchSRV', 'DockSRV', 'SRVDestroyed', 'MiningRefined', 'ProspectedAsteroid', 'LaunchDrone', 'CargoTransfer', 'SAASignalsFound'
+    'LaunchSRV', 'DockSRV', 'SRVDestroyed', 'MiningRefined', 'ProspectedAsteroid', 'LaunchDrone', 'CargoTransfer', 'SAASignalsFound',
+    'NpcCrewPaidWage', 'NpcCrewRank', 'CrewAssign', 'CrewHire', 'CrewFire', 'LaunchFighter', 'DockFighter', 'FighterDestroyed', 'FighterRebuilt'
 ))
 live_re_journal = re.compile('"event":"(' + '|'.join(sorted(LIVE_EVENEMENTS)) + ')"')
 
@@ -1487,7 +1488,9 @@ def live_nouvel_etat():
         'registre': [], 'tot': {'achats': 0, 'ventes': 0, 'benef': 0, 'tonnes': 0, 'nb': 0},
         'missions': {}, 'terminees': [], 'rep': {}, 'rang': {}, 'prog': {},
         'pied': {'on': False, 'suit': '', 'loadout': '', 'mods': [], 'armes': {}, 'sac': {'data': {}, 'comp': {}, 'items': {}, 'conso': {}}},     # a pied : combinaison, armes, sac a dos
-        'minage': live_minage_neuf()
+        'minage': live_minage_neuf(),
+        'equipage': {},                  # equipage PNJ : identifiant -> {n, g (rang de combat), r (role)}
+        'chasseur': None                 # chasseur du hangar : {n, pc (pilote par le joueur), e : vol | hangar | detruit}
     }
 
 
@@ -1620,6 +1623,38 @@ def live_ajouter_registre(ligne):
         del reg[:len(reg) - LIVE_REGISTRE_MAX]
 
 
+def live_equipage(e):
+    """Equipage PNJ du commandant : present des qu'il est paye (a chaque lancement du jeu), retire s'il est renvoye."""
+    ev = e.get('event')
+    eq = live_etat['equipage']
+    cid = str(e.get('NpcCrewId') if e.get('NpcCrewId') is not None else e.get('CrewID'))
+    if cid in ('None', ''):
+        return
+    if ev == 'CrewFire':
+        eq.pop(cid, None)
+        return
+    m = eq.setdefault(cid, {'n': '', 'g': -1, 'r': ''})
+    nom = live_texte(e.get('NpcCrewName') or e.get('Name'))
+    if nom:
+        m['n'] = nom
+    if ev == 'NpcCrewRank':
+        m['g'] = _bn(e.get('RankCombat'))
+    elif ev == 'CrewHire':
+        m['g'] = _bn(e.get('CombatRank'))
+    elif ev == 'CrewAssign':
+        m['r'] = str(e.get('Role') or '')[:20]
+
+
+def live_chasseur(e):
+    """Chasseur du hangar : lance (par un PNJ ou par le joueur), revenu au hangar, detruit (puis reconstruit)."""
+    ev = e.get('event')
+    ch = live_etat.get('chasseur')
+    if ev == 'LaunchFighter':
+        live_etat['chasseur'] = {'n': live_texte(e.get('_Localised') or e.get('') or 'Fighter')[:40], 'pc': bool(e.get('PlayerControlled')), 'e': 'vol'}
+    elif ch:
+        ch['e'] = 'detruit' if ev == 'FighterDestroyed' else 'hangar'
+
+
 def live_appliquer(e):
     """Met a jour l'etat de la session avec un evenement du journal. Appelee sous live_verrou."""
     ev = e.get('event')
@@ -1649,6 +1684,10 @@ def live_appliquer(e):
             pass
         et['vaisseau']['cab'] = live_cabines(e.get('Modules'))                         # cabines de passagers : [[classe, places], ...]
         et['vaisseau']['mods'] = live_modules(e.get('Modules'))                        # modules du vaisseau (hologramme)
+    elif ev in ('NpcCrewPaidWage', 'NpcCrewRank', 'CrewAssign', 'CrewHire', 'CrewFire'):
+        live_equipage(e)
+    elif ev in ('LaunchFighter', 'DockFighter', 'FighterDestroyed', 'FighterRebuilt'):
+        live_chasseur(e)
     elif ev == 'LaunchSRV':
         et['minage']['srv'] = str(e.get('SRVType') or '').lower()
     elif ev in ('DockSRV', 'SRVDestroyed'):
@@ -1940,7 +1979,8 @@ def live_instantane():
             'registre': list(et['registre']), 'tot': dict(et['tot']),
             'missions': missions, 'terminees': list(et['terminees']), 'rep': dict(et['rep']),
             'rang': dict(et['rang']), 'prog': dict(et['prog']), 'pied': live_pied_instantane(et['pied']),
-            'minage': live_minage_instantane(et['minage'])
+            'minage': live_minage_instantane(et['minage']),
+            'equipage': [dict(m) for m in list(et['equipage'].values())[:4]], 'chasseur': dict(et['chasseur']) if et['chasseur'] else None
         }
 
 
