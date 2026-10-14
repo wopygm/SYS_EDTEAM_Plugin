@@ -22,7 +22,7 @@ except ImportError:
     config = None
 
 plugin_name = "SYS.EDTEAM"
-PLUGIN_VERSION = "2.24"
+PLUGIN_VERSION = "2.25"
 
 SUPABASE_URL = "https://oailvdigfdoyfcydmabb.supabase.co"
 SUPABASE_KEY = "sb_publishable_AASqgRggHdIGttZHPGaWkA_VqrhuYNg"
@@ -1623,6 +1623,59 @@ def live_ajouter_registre(ligne):
         del reg[:len(reg) - LIVE_REGISTRE_MAX]
 
 
+live_rangs = {}                 # identifiant PNJ -> rang de combat : le journal ne l'ecrit qu'a un CHANGEMENT de rang, on le retrouve donc dans les anciens journaux
+live_rangs_cherches = set()
+LIVE_RANG_FICHIERS_MAX = 400    # nombre maximal de journaux relus (du plus recent au plus ancien) pour retrouver un rang
+
+
+def live_rangs_sauver():
+    try:
+        with open(col_chemin('crew_rangs.json'), 'w', encoding='utf-8') as f:
+            json.dump(live_rangs, f)
+    except Exception:
+        pass
+
+
+def live_rang_historique(cid):
+    """Dernier rang de combat connu d'un membre d'equipage PNJ : memoire, fichier crew_rangs.json, puis anciens journaux (une seule recherche par lancement)."""
+    if cid in live_rangs:
+        return live_rangs[cid]
+    if cid in live_rangs_cherches:
+        return -1
+    live_rangs_cherches.add(cid)
+    try:
+        chemin = col_chemin('crew_rangs.json')
+        if not live_rangs and os.path.exists(chemin):
+            with open(chemin, 'r', encoding='utf-8') as f:
+                for k, v in json.load(f).items():
+                    live_rangs[str(k)] = int(v)
+        if cid in live_rangs:
+            return live_rangs[cid]
+        jdir = trouver_journal_dir()
+        if jdir and os.path.isdir(jdir):
+            for nom in list(reversed(lister_journaux(jdir)))[:LIVE_RANG_FICHIERS_MAX]:
+                trouve = -1
+                try:
+                    with open(os.path.join(jdir, nom), 'r', encoding='utf-8', errors='ignore') as f:
+                        for ligne in f:
+                            if '"NpcCrewRank"' in ligne and cid in ligne:
+                                try:
+                                    j = json.loads(ligne)
+                                except Exception:
+                                    continue
+                                if str(j.get('NpcCrewId')) == cid:
+                                    trouve = _bn(j.get('RankCombat'))
+                except OSError:
+                    continue
+                if trouve >= 0:
+                    live_rangs[cid] = trouve
+                    live_rangs_sauver()
+                    break
+    except Exception:
+        pass
+    return live_rangs.get(cid, -1)
+
+
 def live_equipage(e):
     """Equipage PNJ du commandant : present des qu'il est paye (a chaque lancement du jeu), retire s'il est renvoye."""
     ev = e.get('event')
@@ -1634,13 +1687,19 @@ def live_equipage(e):
         eq.pop(cid, None)
         return
     m = eq.setdefault(cid, {'n': '', 'g': -1, 'r': ''})
+    if m['g'] < 0 and ev not in ('NpcCrewRank', 'CrewHire'):
+        m['g'] = live_rang_historique(cid)
     nom = live_texte(e.get('NpcCrewName') or e.get('Name'))
     if nom:
         m['n'] = nom
     if ev == 'NpcCrewRank':
         m['g'] = _bn(e.get('RankCombat'))
+        live_rangs[cid] = m['g']
+        live_rangs_sauver()
     elif ev == 'CrewHire':
         m['g'] = _bn(e.get('CombatRank'))
+        live_rangs[cid] = m['g']
+        live_rangs_sauver()
     elif ev == 'CrewAssign':
         m['r'] = str(e.get('Role') or '')[:20]
 
