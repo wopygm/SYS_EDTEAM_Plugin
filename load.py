@@ -22,7 +22,7 @@ except ImportError:
     config = None
 
 plugin_name = "SYS.EDTEAM"
-PLUGIN_VERSION = "2.28"
+PLUGIN_VERSION = "2.29"
 
 SUPABASE_URL = "https://oailvdigfdoyfcydmabb.supabase.co"
 SUPABASE_KEY = "sb_publishable_AASqgRggHdIGttZHPGaWkA_VqrhuYNg"
@@ -465,6 +465,7 @@ COL_LOT_INSTALLATIONS = 100
 COL_MARQUEUR = 'col_marqueur.json'
 COL_RELECTURE_COMPLETE = '2.27'     # a changer pour obliger tous les plugins a relire une fois tous leurs journaux
 COL_ECHECS_MAX = 5
+COL_DELAI_LIVRAISON = 20     # secondes : apres la DERNIERE livraison d'une serie, envoi rapide (au lieu d'attendre jusqu'a 3 a 4 minutes)
 
 col_verrou = threading.Lock()
 col_attente = {'chantiers': {}, 'systemes': {}, 'livraisons': [], 'installations': {}, 'economies': {}}
@@ -474,6 +475,8 @@ col_courant = {'adresse': None, 'nom': None}
 col_etat = {'dernier_envoi': 0, 'rpc_absente': False, 'dernier_ts': '', 'echecs': 0, 'inst_absente': False, 'eco_absente': False}
 col_faction = {'nom': None}   # faction de l'escadron (flag SquadronFaction:true vu aux sauts)
 col_inst_envoyees = set()     # MarketID d'installations deja envoyees pendant cette session
+col_minuteur = {'t': None}    # minuteur d'envoi rapide apres une livraison (remis a zero a chaque nouvelle livraison de la serie)
+col_verrou_minuteur = threading.Lock()
 col_eco_envoyees = {}         # MarketID -> economies (texte JSON) deja envoyees pendant cette session
 
 def col_economies_liste(entry):
@@ -521,8 +524,40 @@ def col_nom_faction(v):
         return v.get('Name')
     return v if isinstance(v, str) and v else None
 
+def col_livraison_recente(ts):
+    """Vrai si l'evenement date de moins de 2 minutes : une livraison relue dans un ancien journal ne declenche aucun envoi rapide."""
+    try:
+        t = live_ts(ts)
+        return t is not None and 0 <= (datetime.now(timezone.utc) - t).total_seconds() < 120
+    except Exception:
+        return False
+
+
+def col_envoi_rapide():
+    """Appele par le minuteur, ~COL_DELAI_LIVRAISON s apres la derniere livraison : envoie tout ce qui est en attente (livraisons ET etat a jour du chantier)."""
+    try:
+        col_envoyer(force=True)
+    except Exception:
+        pass
+
+
+def col_programmer_envoi():
+    """Apres une livraison : un envoi dans COL_DELAI_LIVRAISON s. Chaque nouvelle livraison de la serie remet le compte a zero, donc toutes les marchandises
+    livrees a la suite partent dans UN seul envoi (et le chantier a alors son etat final)."""
+    try:
+        with col_verrou_minuteur:
+            if col_minuteur['t'] is not None:
+                col_minuteur['t'].cancel()
+            t = threading.Timer(COL_DELAI_LIVRAISON, col_envoi_rapide)
+            t.daemon = True
+            col_minuteur['t'] = t
+            t.start()
+    except Exception:
+        pass
+
+
 def col_traiter_evenement(entry):
-    """Traite UN evenement de journal. Ne fait aucun appel reseau."""
+    """Traite UN evenement de journal. Ne fait aucun appel reseau lui-meme (une livraison recente programme seulement un envoi differe de quelques secondes)."""
     ev = entry.get('event')
     ts = entry.get('timestamp')
 
@@ -625,6 +660,8 @@ def col_traiter_evenement(entry):
         if lignes:
             with col_verrou:
                 col_attente['livraisons'].extend(lignes)
+            if col_livraison_recente(ts):
+                col_programmer_envoi()
         col_maj_ts(ts)
         return
 
