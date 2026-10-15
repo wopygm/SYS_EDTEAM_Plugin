@@ -22,7 +22,7 @@ except ImportError:
     config = None
 
 plugin_name = "SYS.EDTEAM"
-PLUGIN_VERSION = "2.27"
+PLUGIN_VERSION = "2.28"
 
 SUPABASE_URL = "https://oailvdigfdoyfcydmabb.supabase.co"
 SUPABASE_KEY = "sb_publishable_AASqgRggHdIGttZHPGaWkA_VqrhuYNg"
@@ -1367,6 +1367,9 @@ LIVE_KEEPALIVE = 600
 LIVE_MINEURS = frozenset(('FSDJump', 'CarrierJump', 'BackpackChange', 'MiningRefined', 'ProspectedAsteroid', 'LaunchDrone', 'SAASignalsFound'))
 LIVE_REGISTRE_MAX = 30
 LIVE_MISSIONS_MAX = 40
+LIVE_MISSIONS_JOURS = 14     # profondeur de recherche des missions dont la prise est dans une partie precedente
+live_inconnues = set()       # missions de la liste « Missions » du jeu dont on ne connait pas encore les details
+live_essayees = set()        # missions deja cherchees dans les anciens journaux (on ne les relit pas a chaque passe)
 LIVE_TERMINEES_MAX = 30
 LIVE_EVENEMENTS = frozenset((
     'Fileheader', 'LoadGame', 'Loadout', 'Location', 'FSDJump', 'CarrierJump', 'Docked', 'Undocked',
@@ -1774,6 +1777,18 @@ def live_chasseur(e):
         ch['e'] = 'detruit' if ev == 'FighterDestroyed' else 'hangar'
 
 
+def live_mission_acceptee(e, ts, systeme, station):
+    """Mission telle qu'elle est enregistree a sa prise (evenement MissionAccepted) ; systeme / station = ou le pilote se trouvait."""
+    return {
+        'id': e.get('MissionID'), 'nom': live_texte(e.get('LocalisedName')), 'type': live_type_mission(e.get('Name')), 'faction': live_texte(e.get('Faction')),
+        'sys': live_texte(e.get('DestinationSystem')), 'st': live_texte(e.get('DestinationStation')), 'exp': e.get('Expiry'),
+        'rec': e.get('Reward'), 'q': _bn(e.get('Count')), 'march': live_texte(e.get('Commodity_Localised')), 'pas': _bn(e.get('PassengerCount')),
+        'vip': 1 if e.get('PassengerVIPs') else 0, 'rech': 1 if e.get('PassengerWanted') else 0, 'ptype': live_texte(e.get('PassengerType')),
+        'don': _bn(e.get('Donation')), 'inf': e.get('Influence'), 'rep': e.get('Reputation'), 't': ts,
+        'os': systeme, 'ost': station     # ou la mission a ete prise (pour le retour au commanditaire)
+    }
+
+
 def live_appliquer(e):
     """Met a jour l'etat de la session avec un evenement du journal. Appelee sous live_verrou."""
     ev = e.get('event')
@@ -1898,15 +1913,7 @@ def live_appliquer(e):
         mid = e.get('MissionID')
         if mid is None:
             return
-        nom = e.get('Name')
-        et['missions'][str(mid)] = {
-            'id': mid, 'nom': live_texte(e.get('LocalisedName')), 'type': live_type_mission(nom), 'faction': live_texte(e.get('Faction')),
-            'sys': live_texte(e.get('DestinationSystem')), 'st': live_texte(e.get('DestinationStation')), 'exp': e.get('Expiry'),
-            'rec': e.get('Reward'), 'q': _bn(e.get('Count')), 'march': live_texte(e.get('Commodity_Localised')), 'pas': _bn(e.get('PassengerCount')),
-            'vip': 1 if e.get('PassengerVIPs') else 0, 'rech': 1 if e.get('PassengerWanted') else 0, 'ptype': live_texte(e.get('PassengerType')),
-            'don': _bn(e.get('Donation')), 'inf': e.get('Influence'), 'rep': e.get('Reputation'), 't': ts,
-            'os': et['systeme'], 'ost': et['station']     # ou la mission a ete prise (pour le retour au commanditaire)
-        }
+        et['missions'][str(mid)] = live_mission_acceptee(e, ts, et['systeme'], et['station'])
         if len(et['missions']) > LIVE_MISSIONS_MAX:
             plus_ancienne = sorted(et['missions'].items(), key=lambda kv: str(kv[1].get('t') or ''))[0][0]
             del et['missions'][plus_ancienne]
@@ -1959,6 +1966,7 @@ def live_appliquer(e):
                         exp = None
                 et['missions'][mid] = {'id': a.get('MissionID'), 'nom': live_texte(a.get('Name')), 'type': live_type_mission(a.get('Name')), 'faction': '', 'sys': '', 'st': '',
                                        'exp': exp, 'rec': None, 'q': 0, 'march': '', 'pas': 0, 'don': 0, 'inf': None, 'rep': None, 't': ts}
+                live_inconnues.add(mid)     # details inconnus (mission prise lors d'une partie precedente) : live_suivre les cherchera dans les anciens journaux
     elif ev == 'Rank':
         et['rang'] = {k: v for k, v in e.items() if k not in ('timestamp', 'event')}
     elif ev == 'Progress':
@@ -2020,6 +2028,94 @@ def live_lire_morceau(chemin, debut):
     return debut + fin + 1
 
 
+LIVE_RE_ANCIENNES = re.compile('"event":"(MissionAccepted|MissionRedirected|Location|FSDJump|CarrierJump|Docked|Undocked)"')
+
+
+def live_retrouver_missions(jdir, fichiers, prefixe, ids):
+    """Cherche dans les journaux des parties PRECEDENTES (LIVE_MISSIONS_JOURS derniers jours) la prise de chacune des missions 'ids' (numeros en texte).
+    Renvoie {numero: mission}, au meme format qu'une mission prise en direct. Les fichiers sont lus du plus ancien au plus recent : une redirection
+    posterieure a la prise est donc prise en compte. Seuls les fichiers qui contiennent un de ces numeros sont analyses."""
+    trouvees = {}
+    cibles = [str(i).encode('ascii', 'ignore') for i in ids]
+    limite = time.time() - LIVE_MISSIONS_JOURS * 86400
+    for nom in fichiers:
+        if nom.split('.')[1] == prefixe:
+            continue                  # la partie en cours est deja lue en entier
+        chemin = os.path.join(jdir, nom)
+        try:
+            if os.path.getmtime(chemin) < limite:
+                continue
+            with open(chemin, 'rb') as f:
+                contenu = f.read()
+        except OSError:
+            continue
+        if not any(c in contenu for c in cibles):
+            continue
+        systeme = station = ''
+        for ligne in contenu.decode('utf-8', errors='ignore').splitlines():
+            if not LIVE_RE_ANCIENNES.search(ligne):
+                continue
+            try:
+                e = json.loads(ligne)
+            except Exception:
+                continue
+            if not isinstance(e, dict):
+                continue
+            ev = e.get('event')
+            if ev in ('Location', 'FSDJump', 'CarrierJump'):
+                if e.get('StarSystem'):
+                    systeme = live_texte(e.get('StarSystem'))
+                amarre = bool(e.get('Docked')) if ev != 'FSDJump' else False
+                station = live_texte(e.get('StationName')) if amarre else ''
+            elif ev == 'Docked':
+                station = live_texte(e.get('StationName'))
+                if e.get('StarSystem'):
+                    systeme = live_texte(e.get('StarSystem'))
+            elif ev == 'Undocked':
+                station = ''
+            elif ev == 'MissionAccepted':
+                mid = str(e.get('MissionID'))
+                if mid in ids:
+                    trouvees[mid] = live_mission_acceptee(e, str(e.get('timestamp') or ''), systeme, station)
+            elif ev == 'MissionRedirected':
+                m = trouvees.get(str(e.get('MissionID')))
+                if m:
+                    if e.get('NewDestinationSystem'):
+                        m['sys'] = live_texte(e.get('NewDestinationSystem'))
+                    if e.get('NewDestinationStation'):
+                        m['st'] = live_texte(e.get('NewDestinationStation'))
+    return trouvees
+
+
+def live_restaurer_missions(jdir, fichiers, prefixe):
+    """Apres un relancement du jeu, la liste « Missions » ne donne que le numero, le nom interne et le temps restant : on retrouve le reste
+    (titre, destination, recompense, passagers, echeance, point de prise) dans les journaux precedents."""
+    with live_verrou:
+        a_chercher = [mid for mid in live_inconnues if mid not in live_essayees and mid in live_etat['missions'] and not live_etat['missions'][mid].get('sys')]
+        live_inconnues.clear()
+        live_essayees.update(a_chercher)
+    if not a_chercher:
+        return
+    try:
+        trouvees = live_retrouver_missions(jdir, fichiers, prefixe, set(a_chercher))
+    except Exception:
+        return
+    live_trace('missions retrouvees dans les anciens journaux : %d sur %d' % (len(trouvees), len(a_chercher)))
+    if not trouvees:
+        return
+    with live_verrou:
+        for mid, m in trouvees.items():
+            cur = live_etat['missions'].get(mid)
+            if not cur:
+                continue                      # terminee ou abandonnee entre-temps
+            if cur.get('sys'):                # une redirection recue depuis garde sa destination
+                m['sys'] = cur['sys']
+                m['st'] = cur.get('st') or m['st']
+            live_etat['missions'][mid] = m
+        live_flags['sale'] = True
+        live_flags['urgent'] = True
+
+
 def live_suivre():
     """Une passe de suivi du journal : au demarrage (ou a chaque nouvelle partie), relit TOUS les morceaux de la session en cours dans l'ordre, puis lit seulement
     ce qui a ete ajoute depuis. On ne depend plus d'EDMC pour recevoir les evenements : tout ce que le journal contient deja au lancement est pris en compte."""
@@ -2044,6 +2140,8 @@ def live_suivre():
         suivi['fichier'] = dernier      # morceau suivant de la meme partie : l'etat continue
         suivi['pos'] = 0
     suivi['pos'] = live_lire_morceau(os.path.join(jdir, suivi['fichier']), suivi['pos'])
+    if live_inconnues:
+        live_restaurer_missions(jdir, fichiers, prefixe)
 
 
 def live_lire_fichier(nom):
