@@ -22,7 +22,7 @@ except ImportError:
     config = None
 
 plugin_name = "SYS.EDTEAM"
-PLUGIN_VERSION = "2.29"
+PLUGIN_VERSION = "2.30"
 
 SUPABASE_URL = "https://oailvdigfdoyfcydmabb.supabase.co"
 SUPABASE_KEY = "sb_publishable_AASqgRggHdIGttZHPGaWkA_VqrhuYNg"
@@ -1414,7 +1414,8 @@ LIVE_EVENEMENTS = frozenset((
     'MissionAbandoned', 'MissionRedirected', 'Missions', 'Rank', 'Progress', 'Promotion', 'Shutdown',
     'Disembark', 'Embark', 'SuitLoadout', 'Backpack', 'BackpackChange',
     'LaunchSRV', 'DockSRV', 'SRVDestroyed', 'MiningRefined', 'ProspectedAsteroid', 'LaunchDrone', 'CargoTransfer', 'SAASignalsFound',
-    'NpcCrewPaidWage', 'NpcCrewRank', 'CrewAssign', 'CrewHire', 'CrewFire', 'LaunchFighter', 'DockFighter', 'FighterDestroyed', 'FighterRebuilt'
+    'NpcCrewPaidWage', 'NpcCrewRank', 'CrewAssign', 'CrewHire', 'CrewFire', 'LaunchFighter', 'DockFighter', 'FighterDestroyed', 'FighterRebuilt',
+    'FSSDiscoveryScan', 'FSSAllBodiesFound', 'FSSBodySignals', 'Scan', 'SAAScanComplete', 'SellExplorationData', 'MultiSellExplorationData', 'ScanOrganic', 'SellOrganicData'     # exploration + exobiologie (2.30)
 ))
 live_re_journal = re.compile('"event":"(' + '|'.join(sorted(LIVE_EVENEMENTS)) + ')"')
 
@@ -1814,6 +1815,509 @@ def live_chasseur(e):
         ch['e'] = 'detruit' if ev == 'FighterDestroyed' else 'hangar'
 
 
+# ==========================================
+# EXPLORATION (onglet Exploration du tableau de bord) : trajet de l'expedition, corps du systeme en cours, valeur ESTIMEE des donnees non vendues.
+# Les valeurs viennent de la formule publiee par la communaute (EDDiscovery, forum Frontier « Exploration value formulae »), verifiee sur les ventes du proprietaire :
+# exacte pour les etoiles, BORNE BASSE pour les planetes scannees au FSS (jamais de surestimation sur 37 ventes), non verifiee pour les cartographies (DSS).
+# Les ceintures d'asteroides (« Belt Cluster ») sont payees par le jeu mais absentes de la formule : seulement comptees.
+# L'etat est garde dans explo_etat.json (a cote de load.py) : il survit a un relancement du jeu ; au premier lancement il est reconstitue depuis les journaux recents.
+# ==========================================
+EXPLO_FICHIER = 'explo_etat.json'
+EXPLO_TRAJET_MAX = 160            # points du trajet envoyes au site (au-dela, les plus anciens sont eclaircis)
+EXPLO_MARQUES_MAX = 40
+EXPLO_DECOUVERTES_MAX = 40        # corps listes dans le journal « ce que j'ai decouvert » (les plus recents)
+EXPLO_JOURS_RATTRAPAGE = 45       # premier lancement : journaux relus sur ces derniers jours
+EXPLO_BALISE = False               # les scans de balise de navigation comptent-ils ? (a confirmer par les ventes)
+EXPLO_SEUIL_OR = 400000           # « trouvaille de grande valeur » : valeur estimee (cartographie efficace comprise) a partir de ce montant
+EXPLO_EVENEMENTS = frozenset(('FSSDiscoveryScan', 'FSSAllBodiesFound', 'FSSBodySignals', 'SAASignalsFound', 'Scan', 'SAAScanComplete',
+                              'SellExplorationData', 'MultiSellExplorationData', 'ScanOrganic', 'SellOrganicData', 'FSDJump', 'CarrierJump', 'Location'))
+explo_re_journal = re.compile('"event":"(' + '|'.join(sorted(EXPLO_EVENEMENTS)) + ')"')
+explo_mem = {'v': 1, 'ts': '', 'sys': None, 'corps': {}, 'trajet': [], 'marques': [], 'sauts': 0, 'dist': 0.0, 'debut': '', 'vente': None, 'pos': None, 'bio': {'ech': {}, 'vente': None}}
+EXPLO_ECH_MAX = 60               # echantillons d'exobiologie envoyes au site (les plus recents)
+explo_etat_init = {'fait': False, 'sale': False, 'sauve': 0.0}
+
+
+def explo_k_etoile(t):
+    t = str(t or '')
+    if t in ('N', 'H'):
+        return 22628.0
+    if t == 'SupermassiveBlackHole':
+        return 33.5678
+    if t.startswith('D'):
+        return 14057.0
+    return 1200.0
+
+
+def explo_k_planete(classe, tf):
+    c = str(classe or '').lower()
+    if c == 'metal rich body':
+        return 21790.0 + (65631.0 if tf else 0.0)
+    if c == 'ammonia world':
+        return 96932.0
+    if c == 'sudarsky class i gas giant':
+        return 1656.0
+    if c in ('sudarsky class ii gas giant', 'high metal content body'):
+        return 9654.0 + (100677.0 if tf else 0.0)
+    if c == 'water world':
+        return 64831.0 + (116295.0 if tf else 0.0)
+    if c == 'earthlike body':
+        return 64831.0 + 116295.0
+    return 300.0 + (93328.0 if tf else 0.0)
+
+
+def explo_ody(v):
+    return v + max(v * 0.3, 555.0)
+
+
+def explo_valeurs(etoile, typ, masse, tf, wasdisc, wasmap, cartographie, efficace):
+    """Valeurs estimees d'un corps : (valeur actuelle, valeur potentielle avec cartographie efficace, part « premiere decouverte » de la valeur actuelle)."""
+    pd = 1.0 if wasdisc else 2.6
+    try:
+        m = max(float(masse), 0.0)
+    except Exception:
+        m = 1.0
+    if etoile:
+        k = explo_k_etoile(typ)
+        v = (k + m * k / 66.25) * pd
+        return int(v), int(v), int(v - v / pd)
+
+    base = max(explo_k_planete(typ, tf) * (1.0 + (m ** 0.2) * 0.56591828), 500.0)
+
+    def carte(eff):
+        if not wasdisc and not wasmap:
+            v = explo_ody(base * 3.699622554) * 2.6
+        elif wasdisc and not wasmap:
+            v = explo_ody(base * 8.0956)
+        else:
+            v = explo_ody(base * 3.3333333)
+        return v * (1.25 if eff else 1.0)
+
+    actuelle = carte(efficace) if cartographie else base * pd
+    potentielle = max(carte(True), actuelle)
+    return int(actuelle), int(potentielle), int(actuelle - actuelle / pd)
+
+
+def explo_cle_codex(brut):
+    """'$Codex_Ent_Stratum_Genus_Name;' -> 'Stratum' ; '$Codex_Ent_Stratum_07_Name;' -> 'Stratum_07' (independant de la langue du jeu)."""
+    t = str(brut or '').replace('$Codex_Ent_', '').replace('_Genus_Name;', '').replace('_Name;', '').replace(';', '')
+    t = re.sub(r'_[A-Z]_?$', '', t)
+    return t
+
+
+def explo_ajouter_point(p):
+    t = explo_mem['trajet']
+    t.append(p)
+    if len(t) > EXPLO_TRAJET_MAX:
+        moitie = len(t) // 2
+        explo_mem['trajet'] = t[:moitie:2] + t[moitie:]      # les plus anciens sont eclaircis, les recents restent precis
+
+
+def explo_marque(typ, nom, cle_sys):
+    s = explo_mem['sys']
+    if not s or not explo_mem['pos']:
+        return
+    k = '%s|%s' % (typ, nom if typ == 'or' else cle_sys)
+    if k in s.setdefault('mk', {}):
+        return
+    s['mk'][k] = 1
+    ms = explo_mem['marques']
+    ms.append({'p': explo_mem['pos'], 't': typ, 'n': str(nom)[:40]})
+    if len(ms) > EXPLO_MARQUES_MAX:
+        del ms[0]
+
+
+def explo_nouvelle_expedition(ts):
+    m = explo_mem
+    dernier = m['trajet'][-1] if m['trajet'] else m['pos']
+    m['trajet'] = [dernier] if dernier else []
+    m['marques'] = []
+    m['sauts'] = 0
+    m['dist'] = 0.0
+    m['debut'] = ts
+
+
+def explo_court(nom, sysnom):
+    n = str(nom or '')
+    s = str(sysnom or '')
+    if n == s:
+        return 'A'
+    if s and n.startswith(s):
+        n = n[len(s):].strip()
+    return n or str(nom)
+
+
+def explo_corps_systeme(e, cle, c, nom_court):
+    """Fiche du corps pour la carte du systeme (envoyee au site) ; seulement si le corps est dans le systeme en cours."""
+    s = explo_mem['sys']
+    if not s or s.get('adr') != e.get('SystemAddress'):
+        return
+    pere = None
+    par = e.get('Parents')
+    if isinstance(par, list) and par and isinstance(par[0], dict) and 'Planet' in par[0]:
+        pere = par[0].get('Planet')
+    est = 1 if e.get('StarType') else 0
+    b = {'i': e.get('BodyID'), 'n': nom_court, 'c': (e.get('StarType') if est else e.get('PlanetClass')) or '', 'e': est,
+         'm': round(float(e.get('StellarMass') if est else (e.get('MassEM') or 0)), 4),
+         'd': round(float(e.get('DistanceFromArrivalLS') or 0), 1), 'p': pere,
+         'a': round(float(e.get('SemiMajorAxis') or 0) / 1.495978707e11, 4),
+         'wd': 1 if e.get('WasDiscovered') else 0, 'wm': 1 if e.get('WasMapped') else 0, 'wf': 1 if e.get('WasFootfalled') else 0,
+         'tf': 1 if e.get('TerraformState') == 'Terraformable' else 0, 'l': 1 if e.get('Landable') else 0,
+         'g': round(float(e.get('SurfaceGravity') or 0) / 9.80665, 2), 'v': c['v'], 'pot': c['pot'], 'cm': c['c']}
+    if est:
+        b['sp'] = '%s%s' % (e.get('StarType') or '', e.get('Subclass') if e.get('Subclass') is not None else '')
+    else:
+        rg = e.get('Rings')
+        if isinstance(rg, list) and rg:
+            b['rg'] = len(rg)                                              # anneaux (dessines autour de la planete)
+        at = str(e.get('Atmosphere') or '').lower()
+        if at and at != 'no atmosphere':
+            b['at'] = at[:30]                                              # atmosphere (halo autour de la planete)
+    s.setdefault('b', {})[str(e.get('BodyID'))] = b
+
+
+def explo_signaux(e, ev):
+    s = explo_mem['sys']
+    if not s or s.get('adr') != e.get('SystemAddress'):
+        return
+    bio = geo = 0
+    for sg in (e.get('Signals') or []):
+        t = (str(sg.get('Type') or '') + str(sg.get('Type_Localised') or '')).lower()
+        n = int(sg.get('Count') or 0)
+        if 'biolog' in t:
+            bio += n
+        elif 'geolog' in t:
+            geo += n
+    d = s.setdefault('sg', {}).setdefault(str(e.get('BodyID')), {})
+    if bio:
+        d['bio'] = bio
+    if geo:
+        d['geo'] = geo
+    if ev == 'SAASignalsFound' and e.get('Genuses'):
+        d['gen'] = [live_texte(g.get('Genus_Localised') or g.get('Genus')) for g in e.get('Genuses')][:8]
+        d['gk'] = [explo_cle_codex(g.get('Genus')) for g in e.get('Genuses')][:8]     # cle du genre : « Stratum », « Aleoids »... (independante de la langue du jeu)
+    c = explo_mem['corps'].get('%s:%s' % (e.get('SystemAddress'), e.get('BodyID')))
+    if c is not None and bio:
+        c['bio'] = bio
+    if bio:
+        explo_marque('bio', live_texte(e.get('BodyName')), '%s|%s' % (e.get('SystemAddress'), e.get('BodyID')))
+
+
+def explo_appliquer(e, ev, ts):
+    m = explo_mem
+    if ev in ('FSDJump', 'CarrierJump', 'Location'):
+        adr = e.get('SystemAddress')
+        nom = live_texte(e.get('StarSystem'))
+        if not adr or not nom:
+            return
+        pos = e.get('StarPos')
+        ok = isinstance(pos, list) and len(pos) == 3
+        nouveau = not m['sys'] or m['sys'].get('adr') != adr
+        if nouveau:
+            m['sys'] = {'adr': adr, 'nom': nom, 'nb': None, 'prog': 0, 'tous': False, 'cb': {}, 'b': {}, 'sg': {}, 'mk': {}}
+        if ok:
+            p = [round(float(v), 1) for v in pos]
+            m['pos'] = p
+            if not m['trajet'] or (nouveau and m['trajet'][-1] != p):
+                explo_ajouter_point(p)
+        if ev == 'FSDJump' and nouveau:
+            m['sauts'] += 1
+            m['dist'] += float(e.get('JumpDist') or 0)
+        if not m['debut']:
+            m['debut'] = ts
+        return
+
+    s = m['sys']
+    if ev == 'FSSDiscoveryScan':
+        if s and s.get('adr') == e.get('SystemAddress'):
+            s['nb'] = e.get('BodyCount')
+            s['prog'] = e.get('Progress') or 0
+        return
+    if ev == 'FSSAllBodiesFound':
+        if s and s.get('adr') == e.get('SystemAddress'):
+            s['tous'] = True
+        return
+    if ev in ('FSSBodySignals', 'SAASignalsFound'):
+        explo_signaux(e, ev)
+        return
+
+    if ev == 'Scan':
+        if e.get('ScanType') == 'NavBeaconDetail' and not EXPLO_BALISE:
+            return
+        nom = live_texte(e.get('BodyName'))
+        adr = e.get('SystemAddress')
+        bid = e.get('BodyID')
+        if not nom or adr is None or bid is None:
+            return
+        if 'Belt Cluster' in nom:
+            if s and s.get('adr') == adr:
+                s['cb'][str(bid)] = 1
+            return
+        est = bool(e.get('StarType'))
+        if not est and not e.get('PlanetClass'):
+            return                                              # anneaux et autres : pas de valeur dans la formule
+        cle = '%s:%s' % (adr, bid)
+        typ = e.get('StarType') if est else e.get('PlanetClass')
+        masse = e.get('StellarMass') if est else e.get('MassEM')
+        tf = e.get('TerraformState') == 'Terraformable'
+        sysnom = live_texte(e.get('StarSystem')) or (s or {}).get('nom') or ''
+        c = m['corps'].get(cle)
+        if c is None:
+            c = {'s': sysnom, 'n': explo_court(nom, sysnom), 'e': 1 if est else 0, 't': typ, 'm': masse if masse is not None else 1.0, 'tf': 1 if tf else 0,
+                 'wd': 1 if e.get('WasDiscovered') else 0, 'wm': 1 if e.get('WasMapped') else 0, 'c': 0, 'f': 0}
+            m['corps'][cle] = c
+        c['ts'] = ts
+        m['corps'].pop(cle, None)
+        m['corps'][cle] = c                                      # le plus recent en dernier (journal du site)
+        v, pot, pdv = explo_valeurs(bool(c['e']), c['t'], c['m'], bool(c['tf']), bool(c['wd']), bool(c['wm']), bool(c['c']), bool(c['f']))
+        c['v'] = v
+        c['p'] = pdv
+        c['pot'] = pot
+        court = explo_court(nom, sysnom)
+        explo_corps_systeme(e, cle, c, court)
+        if not c['wd']:
+            explo_marque('pd', sysnom, sysnom)
+        if pot >= EXPLO_SEUIL_OR:
+            explo_marque('or', '%s · %s' % (sysnom, court), sysnom)
+        return
+
+    if ev == 'SAAScanComplete':
+        cle = '%s:%s' % (e.get('SystemAddress'), e.get('BodyID'))
+        c = m['corps'].get(cle)
+        if c is None:
+            return
+        c['c'] = 1
+        c['ts'] = ts
+        m['corps'].pop(cle, None)
+        m['corps'][cle] = c
+        c['f'] = 1 if (e.get('ProbesUsed') or 99) <= (e.get('EfficiencyTarget') or 0) else 0
+        v, pot, pdv = explo_valeurs(bool(c['e']), c['t'], c['m'], bool(c['tf']), bool(c['wd']), bool(c['wm']), True, bool(c['f']))
+        c['v'] = v
+        c['p'] = pdv
+        c['pot'] = pot
+        if s and s.get('adr') == e.get('SystemAddress'):
+            b = (s.get('b') or {}).get(str(e.get('BodyID')))
+            if b is not None:
+                b['v'] = v
+                b['pot'] = pot
+                b['cm'] = 1
+        return
+
+    if ev == 'ScanOrganic':
+        bio = m['bio']
+        sp = explo_cle_codex(e.get('Species'))
+        if not sp:
+            return
+        cle = '%s:%s:%s' % (e.get('SystemAddress'), e.get('Body'), sp)
+        k = {'log': 1, 'sample': 2, 'analyse': 3}.get(str(e.get('ScanType') or '').lower(), 0)
+        if not k:
+            return
+        sy = s.get('nom') if s and s.get('adr') == e.get('SystemAddress') else ''
+        bn = ''
+        if s and s.get('adr') == e.get('SystemAddress'):
+            bn = ((s.get('b') or {}).get(str(e.get('Body'))) or {}).get('n') or ''
+        c = bio['ech'].get(cle)
+        if c is None:
+            c = {'g': live_texte(e.get('Genus_Localised') or e.get('Genus')), 'gk': explo_cle_codex(e.get('Genus')), 's': live_texte(e.get('Species_Localised') or e.get('Species')), 'sc': sp,
+                 'va': live_texte(e.get('Variant_Localised') or e.get('Variant')), 'k': 0, 'nv': 0, 'sy': sy, 'bn': bn, 'bi': e.get('Body'), 'adr': e.get('SystemAddress')}
+            bio['ech'][cle] = c
+        if k == 1 and not e.get('WasLogged'):
+            c['nv'] = 1                                      # premiere fois dans le codex du pilote (le jeu donne cette information au premier prelevement)
+        if k > c['k']:
+            c['k'] = k
+        if sy and not c.get('sy'):
+            c['sy'] = sy
+        if bn and not c.get('bn'):
+            c['bn'] = bn
+        c['t'] = ts
+        pp = explo_position_vivante(ts)
+        if pp:                                               # ou le prelevement a ete fait (3 sites par espece : Log, Sample, Analyse) : sert a verifier la distance minimale entre deux sites
+            pts = c.setdefault('pts', [None, None, None])
+            pts[k - 1] = [pp['la'], pp['lo']]
+            c['r'] = pp['r'] or c.get('r', 0)
+            c['bf'] = pp['bn'] or c.get('bf', '')
+        return
+
+    if ev == 'SellOrganicData':
+        if bio_vente_deja(ts):
+            return
+        bio = m['bio']
+        reel = 0
+        vendus = []
+        for it in (e.get('BioData') or []):
+            reel += int(it.get('Value') or 0) + int(it.get('Bonus') or 0)
+            sp = explo_cle_codex(it.get('Species'))
+            vendus.append(sp)
+            for k2 in [k for k, c in bio['ech'].items() if c.get('sc') == sp and c.get('k') == 3][:1]:
+                del bio['ech'][k2]
+        if reel or vendus:
+            bio['vente'] = {'t': ts, 'reel': int(reel), 'sc': vendus[:40], 'n': len(vendus)}
+        return
+
+    if ev in ('SellExplorationData', 'MultiSellExplorationData'):
+        if m['vente'] and m['vente'].get('t') == ts:
+            return                   # vente deja traitee (relecture)
+        if ev == 'SellExplorationData':
+            noms = set(e.get('Systems') or [])
+        else:
+            noms = set(x.get('SystemName') for x in (e.get('Discovered') or []))
+        cles = [k for k, c in m['corps'].items() if c.get('s') in noms]
+        est = sum(m['corps'][k].get('v', 0) for k in cles)
+        reel = int(e.get('BaseValue') or 0) + int(e.get('Bonus') or 0)
+        if reel or est:
+            m['vente'] = {'t': ts, 'est': int(est), 'reel': reel, 'tot': int(e.get('TotalEarnings') or 0), 'n': len(cles)}
+        for k in cles:
+            del m['corps'][k]
+        explo_nouvelle_expedition(ts)                            # les statistiques repartent a zero a chaque vente
+        return
+
+
+
+def explo_position_vivante(ts):
+    """Position du pilote (latitude, longitude, rayon de la planete, nom du corps) lue dans Status.json, seulement pour un evenement vivant (moins de 2 minutes) : jamais pour une relecture de vieux journaux."""
+    try:
+        d = datetime.strptime(ts, '%Y-%m-%dT%H:%M:%SZ').replace(tzinfo=timezone.utc)
+        if abs((datetime.now(timezone.utc) - d).total_seconds()) > 120:
+            return None
+    except Exception:
+        return None
+    st = live_lire_fichier('Status.json') or {}
+    try:
+        if not (int(st.get('Flags') or 0) & 2097152) or st.get('Latitude') is None or st.get('Longitude') is None:
+            return None
+        return {'la': round(float(st.get('Latitude')), 5), 'lo': round(float(st.get('Longitude')), 5), 'r': int(st.get('PlanetRadius') or 0),
+                'h': int(st.get('Heading') or 0) if st.get('Heading') is not None else None, 'bn': str(st.get('BodyName') or '')[:60]}
+    except Exception:
+        return None
+
+
+def bio_vente_deja(ts):
+    v = explo_mem['bio'].get('vente')
+    return bool(v and v.get('t') == ts)
+
+
+def explo_traiter(e):
+    """Un evenement du journal (appelee sous live_verrou). Les evenements deja pris en compte (relecture apres un relancement) sont ignores."""
+    ev = e.get('event')
+    if ev not in EXPLO_EVENEMENTS:
+        return
+    ts = str(e.get('timestamp') or '')
+    if ts and explo_mem['ts'] and ts < explo_mem['ts']:
+        return                       # strictement plus ancien : deja pris en compte (les rafales de scans partagent la meme seconde : elles passent, les traitements sont sans doublon)
+    try:
+        explo_appliquer(e, ev, ts)
+    except Exception:
+        pass
+    if ts:
+        explo_mem['ts'] = ts
+    explo_etat_init['sale'] = True
+
+
+def explo_instantane():
+    """Partie « exploration » de l'instantane envoye au site (None tant que le pilote n'a rien explore)."""
+    m = explo_mem
+    if not m['sys'] and not m['trajet'] and not m['corps'] and not m['bio']['ech']:
+        return None
+    s = m['sys'] or {}
+    corps = list(m['corps'].values())
+    sg = s.get('sg') or {}
+    bodies = []
+    for k, b in (s.get('b') or {}).items():
+        b = dict(b)
+        d = sg.get(k)
+        if d:
+            b.update(d)
+        bodies.append(b)
+    bodies.sort(key=lambda b: (b.get('d') or 0, b.get('i') or 0))
+    dec = []
+    for c in reversed(corps[-EXPLO_DECOUVERTES_MAX:]):         # du plus recent au plus ancien ; les champs a zero ne sont pas envoyes
+        x = {'s': c.get('s'), 'n': c.get('n') or '?', 't': c.get('t'), 'v': c.get('v', 0), 'pot': c.get('pot', 0), 'ts': c.get('ts')}
+        for k, val in (('e', c.get('e')), ('pd', 0 if c.get('wd') else 1), ('c', c.get('c')), ('tf', c.get('tf')), ('bio', c.get('bio'))):
+            if val:
+                x[k] = val
+        dec.append(x)
+    ech = sorted(m['bio']['ech'].values(), key=lambda c: c.get('t', ''), reverse=True)[:EXPLO_ECH_MAX]
+    bio = {'ech': [{k: c.get(k) for k in ('g', 'gk', 's', 'sc', 'va', 'k', 'nv', 'sy', 'bn', 'bi', 't', 'pts', 'r', 'bf')} for c in ech], 'vente': m['bio'].get('vente')} if (ech or m['bio'].get('vente')) else None
+    if bio and any(c.get('pts') for c in ech):
+        st = live_lire_fichier('Status.json') or {}              # position actuelle : seulement quand des prelevements existent, et avec l'envoi normal (aucun envoi supplementaire)
+        try:
+            if int(st.get('Flags') or 0) & 2097152 and st.get('Latitude') is not None and st.get('Longitude') is not None:
+                bio['ici'] = {'la': round(float(st['Latitude']), 5), 'lo': round(float(st['Longitude']), 5), 'h': st.get('Heading'), 'bn': str(st.get('BodyName') or '')[:60], 't': str(st.get('timestamp') or '')}
+        except Exception:
+            pass
+    return {'v': 1,
+            'dec': dec,
+            'bio': bio,
+            'sys': {'nom': s.get('nom'), 'nb': s.get('nb'), 'prog': s.get('prog'), 'tous': bool(s.get('tous')), 'ceint': len(s.get('cb') or {}), 'b': bodies} if s else None,
+            'nv': {'v': int(sum(c.get('v', 0) for c in corps)), 'pd': int(sum(c.get('p', 0) for c in corps)), 'n': len(corps),
+                   'sys': len(set(c.get('s') for c in corps)), 'cartos': sum(1 for c in corps if c.get('c'))},
+            'tot': {'sauts': m['sauts'], 'dist': round(m['dist'], 1), 'debut': m['debut']},
+            'vente': m['vente']}
+
+
+def explo_charger():
+    """Relit explo_etat.json ; renvoie True si l'etat a ete retrouve."""
+    try:
+        with open(col_chemin(EXPLO_FICHIER), 'r', encoding='utf-8') as f:
+            d = json.load(f)
+        if isinstance(d, dict) and d.get('v') == 1 and isinstance(d.get('corps'), dict):
+            with live_verrou:
+                explo_mem.update(d)
+                if not isinstance(explo_mem.get('bio'), dict) or 'ech' not in explo_mem['bio']:
+                    explo_mem['bio'] = {'ech': {}, 'vente': None}
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def explo_sauver_si_besoin():
+    """Ecrit explo_etat.json si quelque chose a change (au plus toutes les 20 s)."""
+    if not explo_etat_init['sale'] or time.time() - explo_etat_init['sauve'] < 20:
+        return
+    try:
+        with live_verrou:
+            texte = json.dumps(explo_mem, ensure_ascii=False)
+            explo_etat_init['sale'] = False
+        chemin = col_chemin(EXPLO_FICHIER)
+        with open(chemin + '.tmp', 'w', encoding='utf-8') as f:
+            f.write(texte)
+        os.replace(chemin + '.tmp', chemin)
+        explo_etat_init['sauve'] = time.time()
+    except Exception:
+        pass
+
+
+def explo_demarrer(jdir, fichiers):
+    """Une seule fois par lancement : charge l'etat sauvegarde ; sinon le reconstitue depuis les journaux des EXPLO_JOURS_RATTRAPAGE derniers jours."""
+    if explo_etat_init['fait']:
+        return
+    explo_etat_init['fait'] = True
+    if explo_charger():
+        return
+    limite = time.time() - EXPLO_JOURS_RATTRAPAGE * 86400
+    for nom in fichiers:
+        chemin = os.path.join(jdir, nom)
+        try:
+            if os.path.getmtime(chemin) < limite:
+                continue
+            with open(chemin, 'r', encoding='utf-8', errors='ignore') as f:
+                lignes = f.read().splitlines()
+        except OSError:
+            continue
+        for ligne in lignes:
+            if not explo_re_journal.search(ligne):
+                continue
+            try:
+                e = json.loads(ligne)
+            except Exception:
+                continue
+            if isinstance(e, dict):
+                with live_verrou:
+                    explo_traiter(e)
+    explo_etat_init['sale'] = True
+    explo_sauver_si_besoin()
+
+
 def live_mission_acceptee(e, ts, systeme, station):
     """Mission telle qu'elle est enregistree a sa prise (evenement MissionAccepted) ; systeme / station = ou le pilote se trouvait."""
     return {
@@ -1831,6 +2335,8 @@ def live_appliquer(e):
     ev = e.get('event')
     ts = str(e.get('timestamp') or '')
     et = live_etat
+    if ev in EXPLO_EVENEMENTS:
+        explo_traiter(e)                  # exploration : etat propre (explo_mem), conserve d'un lancement a l'autre
     if ev == 'Fileheader':
         if _bn(e.get('part') or 1) <= 1:
             et.update(live_nouvel_etat())
@@ -2162,6 +2668,7 @@ def live_suivre():
     fichiers = lister_journaux(jdir)
     if not fichiers:
         return
+    explo_demarrer(jdir, fichiers)      # exploration : etat sauvegarde, ou reconstitution depuis les journaux recents (une seule fois par lancement)
     dernier = fichiers[-1]
     prefixe = dernier.split('.')[1]
     suivi = live_suivi
@@ -2234,6 +2741,7 @@ def live_instantane():
             'missions': missions, 'terminees': list(et['terminees']), 'rep': dict(et['rep']),
             'rang': dict(et['rang']), 'prog': dict(et['prog']), 'pied': live_pied_instantane(et['pied']),
             'minage': live_minage_instantane(et['minage']),
+            'explo': explo_instantane(),
             'equipage': [dict(m) for m in list(et['equipage'].values())[:4]], 'chasseur': dict(et['chasseur']) if et['chasseur'] else None
         }
 
@@ -2291,6 +2799,10 @@ def live_boucle():
         except Exception as ex:
             live_trace('suivi du journal : %r' % (ex,))
         live_flags['pret'] = True
+        try:
+            explo_sauver_si_besoin()
+        except Exception:
+            pass
         try:
             live_envoyer()
         except Exception as ex:
@@ -2368,6 +2880,11 @@ def plugin_start3(plugin_dir):
     return "SYS.EDTEAM"
 
 def plugin_stop():
+    try:
+        explo_etat_init['sauve'] = 0
+        explo_etat_init['sale'] = True
+        explo_sauver_si_besoin()
+    except Exception: pass
     try: pp_envoyer(force=True)
     except: pass
     try: col_envoyer(force=True)
