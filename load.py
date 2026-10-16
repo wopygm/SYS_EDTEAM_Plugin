@@ -22,7 +22,7 @@ except ImportError:
     config = None
 
 plugin_name = "SYS.EDTEAM"
-PLUGIN_VERSION = "2.30"
+PLUGIN_VERSION = "2.31"
 
 SUPABASE_URL = "https://oailvdigfdoyfcydmabb.supabase.co"
 SUPABASE_KEY = "sb_publishable_AASqgRggHdIGttZHPGaWkA_VqrhuYNg"
@@ -2260,6 +2260,8 @@ def explo_charger():
         with open(col_chemin(EXPLO_FICHIER), 'r', encoding='utf-8') as f:
             d = json.load(f)
         if isinstance(d, dict) and d.get('v') == 1 and isinstance(d.get('corps'), dict):
+            if any(not (c or {}).get('ts') for c in d['corps'].values()):
+                return False                 # etat ecrit avant les dates (version de test) : on le reconstitue depuis les journaux, pour que chaque scan ait sa date
             with live_verrou:
                 explo_mem.update(d)
                 if not isinstance(explo_mem.get('bio'), dict) or 'ech' not in explo_mem['bio']:
