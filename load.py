@@ -22,7 +22,7 @@ except ImportError:
     config = None
 
 plugin_name = "SYS.EDTEAM"
-PLUGIN_VERSION = "2.31"
+PLUGIN_VERSION = "2.32"
 
 SUPABASE_URL = "https://oailvdigfdoyfcydmabb.supabase.co"
 SUPABASE_KEY = "sb_publishable_AASqgRggHdIGttZHPGaWkA_VqrhuYNg"
@@ -449,6 +449,256 @@ def pp_scanner_journaux(jours=21):
         pp_envoyer(force=True)
     except Exception as e:
         logging.error(f"[SYS_EDTEAM] Erreur relecture Powerplay : {e}")
+
+# ==========================================
+# POWERPLAY PAR SYSTEME (v2.32, scripts SQL 96 et 97) : etat des systemes observes dans les journaux + merites rattaches au systeme ou se trouve le pilote.
+# Aucun appel reseau dans le traitement d'un evenement (ppm_traiter_evenement) : tout est mis en attente, puis envoye par lots (ppm_envoyer, au plus toutes les PPM_INTERVALLE_ENVOI secondes).
+# Le serveur ignore les doublons : renvoyer deux fois le meme evenement n'ajoute rien. Les merites sont typés d'apres l'etat du systeme :
+#   la puissance du pilote controle le systeme = RENFORCEMENT ; une autre puissance le controle = SAPE ; aucune ne le controle mais des puissances sont presentes = ACQUISITION ; sinon AUTRE (hors mission).
+# Au premier lancement de cette version, les 45 derniers jours de journaux sont relus une fois ; ensuite seulement ce qui est plus recent que le dernier envoi (moins 1 heure).
+# ==========================================
+PPM_INTERVALLE_ENVOI = 120
+PPM_LOT_OBS = 300
+PPM_LOT_MER = 400
+PPM_LOTS_PAR_PASSE = 6
+PPM_MAX_ATTENTE = 6000
+PPM_RELECTURE = '2.32'          # a changer pour obliger tous les plugins a relire une fois leurs journaux
+PPM_JOURS_RELECTURE = 45
+PPM_MARQUEUR = 'ppm_marqueur.json'
+PPM_ORIGINES = {
+    'Bounty': 'PRIMES', 'RedeemVoucher': 'PRIMES', 'FactionKillBond': 'COMBAT', 'MissionCompleted': 'MISSIONS',
+    'PowerplayDeliver': 'LIVRAISONS', 'PowerplayCollect': 'LIVRAISONS', 'MarketSell': 'COMMERCE',
+    'SellExplorationData': 'EXPLORATION', 'MultiSellExplorationData': 'EXPLORATION', 'SearchAndRescue': 'SAUVETAGE',
+    'CommunityGoalReward': 'COMMUNAUTE',
+}
+PPM_MOTS = tuple('"event":"%s"' % n for n in ('Location', 'FSDJump', 'CarrierJump', 'PowerplayMerits') + tuple(PPM_ORIGINES.keys()))
+
+ppm_verrou = threading.Lock()
+ppm_attente = {'obs': [], 'mer': []}
+ppm_vu = {}        # adresse -> signature de la derniere observation mise en attente (pas de renvoi d'un etat identique)
+ppm_live = {'nom': None, 'adresse': None, 'etat': None, 'evt': None, 'evt_t': 0.0}
+ppm_flags = {'dernier_envoi': 0, 'obs_absente': False, 'mer_absente': False, 'echecs': 0, 'dernier_ts': ''}
+
+def ppm_chemin(nom):
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), nom)
+
+def ppm_trace(msg):
+    """Diagnostic : n'ecrit QUE si un fichier ppm_debug.txt existe deja a cote de load.py (le creer vide pour activer)."""
+    try:
+        if not os.path.exists(ppm_chemin('ppm_debug.txt')):
+            return
+        with open(ppm_chemin('ppm_debug.txt'), 'a', encoding='utf-8') as f:
+            f.write(datetime.now().strftime('%H:%M:%S') + ' ' + str(msg) + chr(10))
+    except Exception:
+        pass
+
+def ppm_epoch(ts):
+    try:
+        return datetime.strptime(ts, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc).timestamp()
+    except Exception:
+        return None
+
+def ppm_type(puissance, etat):
+    """Type de merites d'apres l'etat du systeme ou se trouve le pilote (voir l'en-tete du bloc)."""
+    if not etat:
+        return 'AUTRE'
+    ctrl = etat.get('controlling')
+    if ctrl and puissance and ctrl == puissance:
+        return 'RENFORCEMENT'
+    if ctrl:
+        return 'SAPE'
+    if etat.get('powers'):
+        return 'ACQUISITION'
+    return 'AUTRE'
+
+def ppm_etat_depuis(e):
+    """L'etat Powerplay d'un systeme tel que le journal l'ecrit a l'arrivee (None si le journal n'en dit rien)."""
+    if ('PowerplayState' not in e) and ('Powers' not in e) and ('ControllingPower' not in e):
+        return None
+    powers = e.get('Powers')
+    return {
+        'controlling': e.get('ControllingPower') or None,
+        'powers': [str(p) for p in powers] if isinstance(powers, list) else [],
+        'etat': e.get('PowerplayState') or None,
+        'progres': e.get('PowerplayStateControlProgress'),
+        'renf': e.get('PowerplayStateReinforcement'),
+        'sape': e.get('PowerplayStateUndermining'),
+    }
+
+def ppm_traiter_evenement(e, st, depuis=0.0):
+    """Traite UN evenement (en direct comme a la relecture). st : etat courant (systeme, etat Powerplay, dernier evenement a l'origine d'un merite).
+    depuis : horodatage (secondes) en dessous duquel rien n'est mis en attente (l'etat courant est tout de meme tenu a jour)."""
+    ev = e.get('event')
+    ts = e.get('timestamp')
+    if ev in ('Location', 'FSDJump', 'CarrierJump'):
+        nom = e.get('StarSystem')
+        adr = e.get('SystemAddress')
+        if not nom or adr is None:
+            return
+        st['nom'] = nom
+        st['adresse'] = adr
+        st['evt'] = None
+        etat = ppm_etat_depuis(e)
+        st['etat'] = etat
+        if etat is None:
+            return
+        t = ppm_epoch(ts)
+        if t is None or t < depuis:
+            return
+        signature = (etat['controlling'], etat['etat'], etat['progres'], etat['renf'], etat['sape'])
+        with ppm_verrou:
+            if ppm_vu.get(adr) == signature or len(ppm_attente['obs']) >= PPM_MAX_ATTENTE:
+                return
+            ppm_vu[adr] = signature
+            ppm_attente['obs'].append({'adresse': int(adr), 'nom': str(nom), 'ts': ts, 'controlling': etat['controlling'], 'powers': etat['powers'],
+                                       'etat': etat['etat'], 'progres': etat['progres'], 'renf': etat['renf'], 'sape': etat['sape']})
+            if ts and str(ts) > ppm_flags['dernier_ts']:
+                ppm_flags['dernier_ts'] = str(ts)
+        return
+    if ev == 'PowerplayMerits':
+        try:
+            gain = int(e.get('MeritsGained') or 0)
+            total = e.get('TotalMerits')
+            if gain <= 0 or total is None or not st.get('nom'):
+                return
+            t = ppm_epoch(ts)
+            if t is None or t < depuis:
+                return
+            origine = 'AUTRE'
+            if st.get('evt') and t - float(st.get('evt_t') or 0) <= 3.0:
+                origine = PPM_ORIGINES.get(st['evt'], 'AUTRE')
+            ligne = {'ts': ts, 'systeme': str(st['nom']), 'adresse': int(st['adresse']) if st.get('adresse') is not None else None,
+                     'merites': gain, 'total': int(total), 'type': ppm_type(e.get('Power'), st.get('etat')), 'origine': origine}
+            with ppm_verrou:
+                if len(ppm_attente['mer']) < PPM_MAX_ATTENTE:
+                    ppm_attente['mer'].append(ligne)
+                    if ts and str(ts) > ppm_flags['dernier_ts']:
+                        ppm_flags['dernier_ts'] = str(ts)
+        except Exception:
+            pass
+        return
+    if ev in PPM_ORIGINES:
+        st['evt'] = ev
+        st['evt_t'] = ppm_epoch(ts) or 0.0
+
+def ppm_post(rpc, payload, drapeau):
+    """Un appel de fonction serveur. Vrai si le lot est traite (ou si la fonction n'existe pas encore : on ne reessaie pas)."""
+    try:
+        res = requests.post(f"{SUPABASE_URL}/rest/v1/rpc/{rpc}", headers=get_headers(), json=payload, timeout=20)
+        ppm_trace('%s : %d lignes -> HTTP %s %s' % (rpc, len(payload.get('p_lot') or []), res.status_code, (res.text or '')[:120]))
+        if res.status_code in (200, 201, 204):
+            return True
+        if res.status_code == 404:
+            ppm_flags[drapeau] = True
+            return True
+        return False
+    except Exception as ex:
+        ppm_trace('%s : echec %r' % (rpc, ex))
+        return False
+
+def ppm_lire_marqueur():
+    try:
+        with open(ppm_chemin(PPM_MARQUEUR), 'r', encoding='utf-8') as f:
+            d = json.load(f)
+        if d.get('rel') != PPM_RELECTURE:
+            return ''
+        return d.get('dernier_ts') or ''
+    except Exception:
+        return ''
+
+def ppm_ecrire_marqueur(ts):
+    if not ts:
+        return
+    try:
+        with open(ppm_chemin(PPM_MARQUEUR), 'w', encoding='utf-8') as f:
+            json.dump({'dernier_ts': ts, 'rel': PPM_RELECTURE}, f)
+    except Exception:
+        pass
+
+def ppm_envoyer(force=False):
+    """Envoie ce qui est en attente, par lots (observations puis merites). Au plus un envoi toutes les PPM_INTERVALLE_ENVOI secondes, sauf force. Renvoie vrai si tout est parti."""
+    if ppm_flags['obs_absente'] and ppm_flags['mer_absente']:
+        return True
+    with ppm_verrou:
+        if not ppm_attente['obs'] and not ppm_attente['mer']:
+            return True
+        if not force and time.time() - ppm_flags['dernier_envoi'] < PPM_INTERVALLE_ENVOI:
+            return False
+        ppm_flags['dernier_envoi'] = time.time()
+    if not get_user_id():
+        ppm_trace('envoi differe : get_user_id() vide')
+        return False
+    for _ in range(PPM_LOTS_PAR_PASSE):
+        with ppm_verrou:
+            lot_o = list(ppm_attente['obs'][:PPM_LOT_OBS])
+            lot_m = list(ppm_attente['mer'][:PPM_LOT_MER])
+        if not lot_o and not lot_m:
+            break
+        ok_o = True
+        ok_m = True
+        if lot_o and not ppm_flags['obs_absente']:
+            ok_o = ppm_post('pp_observer', {'p_lot': lot_o}, 'obs_absente')
+        if lot_m and not ppm_flags['mer_absente']:
+            ok_m = ppm_post('pp_merites_releve', {'p_lot': lot_m}, 'mer_absente')
+        with ppm_verrou:
+            if lot_o and ok_o:
+                del ppm_attente['obs'][:len(lot_o)]
+            if lot_m and ok_m:
+                del ppm_attente['mer'][:len(lot_m)]
+        if not (ok_o and ok_m):
+            ppm_flags['echecs'] += 1
+            return False
+    ppm_flags['echecs'] = 0
+    with ppm_verrou:
+        reste = len(ppm_attente['obs']) + len(ppm_attente['mer'])
+        dernier = ppm_flags['dernier_ts']
+    if reste == 0:
+        ppm_ecrire_marqueur(dernier)
+    return reste == 0
+
+def ppm_scanner_journaux():
+    """Relit les journaux : 45 jours la premiere fois, ensuite seulement depuis le dernier envoi (moins 1 heure). L'etat courant (systeme, puissance qui le controle) est reconstitue
+    en suivant les evenements dans l'ordre ; seuls les evenements assez recents sont mis en attente."""
+    try:
+        jdir = trouver_journal_dir()
+        ppm_trace('relecture : dossier des journaux = %s' % jdir)
+        if not jdir or not os.path.isdir(jdir):
+            return
+        marqueur = ppm_lire_marqueur()
+        maintenant = time.time()
+        depuis = maintenant - PPM_JOURS_RELECTURE * 86400
+        if marqueur:
+            t = ppm_epoch(marqueur)
+            if t is not None:
+                depuis = max(depuis, t - 3600)
+        fichiers = [f for f in lister_journaux(jdir) if os.path.getmtime(os.path.join(jdir, f)) >= depuis - 2 * 86400]
+        st = {'nom': None, 'adresse': None, 'etat': None, 'evt': None, 'evt_t': 0.0}
+        nb = 0
+        for nom_fichier in fichiers:
+            with open(os.path.join(jdir, nom_fichier), 'r', encoding='utf-8', errors='ignore') as f:
+                for ligne in f:
+                    if not any(m in ligne for m in PPM_MOTS):
+                        continue
+                    try:
+                        e = json.loads(ligne)
+                    except Exception:
+                        continue
+                    if not isinstance(e, dict):
+                        continue
+                    ppm_traiter_evenement(e, st, depuis)
+                    nb += 1
+        with ppm_verrou:
+            n_o = len(ppm_attente['obs'])
+            n_m = len(ppm_attente['mer'])
+        ppm_trace('relecture : %d fichiers, %d evenements utiles, en attente : %d observations, %d merites (marqueur = %s)' % (len(fichiers), nb, n_o, n_m, marqueur or 'aucun'))
+        for _ in range(40):
+            if ppm_envoyer(force=True):
+                break
+            if ppm_flags['echecs'] > 0:
+                break
+        ppm_trace('relecture terminee')
+    except Exception as ex:
+        ppm_trace('relecture : EXCEPTION %r' % (ex,))
 
 # ==========================================
 # COLONISATION : chantiers, livraisons et systemes revendiques, releves automatiquement dans les journaux de jeu.
@@ -2829,6 +3079,8 @@ def heartbeat_loop():
         except: pass
         try: pp_envoyer()   # merites Powerplay : envoi si du (au plus toutes les 5 min)
         except: pass
+        try: ppm_envoyer()  # Powerplay par systeme : etat des systemes et merites en attente (au plus toutes les 2 min)
+        except: pass
         try: col_envoyer()  # colonisation : envoi regroupe si du (au plus toutes les 3 min)
         except: pass
         try: bud_envoyer()  # budget : totaux des cycles modifies et nouvelles lignes du livre (au plus toutes les 5 min)
@@ -2877,6 +3129,7 @@ def plugin_start3(plugin_dir):
     threading.Thread(target=check_for_updates, daemon=True).start()
     threading.Thread(target=pp_scanner_journaux, daemon=True).start()
     threading.Thread(target=col_scanner_journaux, daemon=True).start()
+    threading.Thread(target=ppm_scanner_journaux, daemon=True).start()
     threading.Thread(target=bud_scanner_journaux, daemon=True).start()
     threading.Thread(target=live_boucle, daemon=True).start()
     return "SYS.EDTEAM"
@@ -2888,6 +3141,8 @@ def plugin_stop():
         explo_sauver_si_besoin()
     except Exception: pass
     try: pp_envoyer(force=True)
+    except: pass
+    try: ppm_envoyer(force=True)
     except: pass
     try: col_envoyer(force=True)
     except: pass
@@ -3050,6 +3305,10 @@ def journal_entry(cmdr, is_beta, system, station, entry, state):
     # Colonisation : releve des chantiers, livraisons et systemes (aucun appel reseau ici)
     try: col_traiter_evenement(entry)
     except Exception as e: col_trace('evenement ignore : %r' % (e,))
+
+    # Powerplay par systeme : etat des systemes et merites rattaches au systeme (aucun appel reseau ici)
+    try: ppm_traiter_evenement(entry, ppm_live)
+    except Exception as e: ppm_trace('evenement ignore : %r' % (e,))
 
     # Budget : revenus et charges (aucun appel reseau ici)
     try: bud_traiter_evenement(entry)
