@@ -22,7 +22,7 @@ except ImportError:
     config = None
 
 plugin_name = "SYS.EDTEAM"
-PLUGIN_VERSION = "2.32"
+PLUGIN_VERSION = "2.33"
 
 SUPABASE_URL = "https://oailvdigfdoyfcydmabb.supabase.co"
 SUPABASE_KEY = "sb_publishable_AASqgRggHdIGttZHPGaWkA_VqrhuYNg"
@@ -1665,13 +1665,14 @@ LIVE_EVENEMENTS = frozenset((
     'Disembark', 'Embark', 'SuitLoadout', 'Backpack', 'BackpackChange',
     'LaunchSRV', 'DockSRV', 'SRVDestroyed', 'MiningRefined', 'ProspectedAsteroid', 'LaunchDrone', 'CargoTransfer', 'SAASignalsFound',
     'NpcCrewPaidWage', 'NpcCrewRank', 'CrewAssign', 'CrewHire', 'CrewFire', 'LaunchFighter', 'DockFighter', 'FighterDestroyed', 'FighterRebuilt',
-    'FSSDiscoveryScan', 'FSSAllBodiesFound', 'FSSBodySignals', 'Scan', 'SAAScanComplete', 'SellExplorationData', 'MultiSellExplorationData', 'ScanOrganic', 'SellOrganicData'     # exploration + exobiologie (2.30)
+    'FSSDiscoveryScan', 'FSSAllBodiesFound', 'FSSBodySignals', 'Scan', 'SAAScanComplete', 'SellExplorationData', 'MultiSellExplorationData', 'ScanOrganic', 'SellOrganicData',     # exploration + exobiologie (2.30)
+    'StartJump'     # annonce « saut hyperespace » aux passagers (2.33)
 ))
 live_re_journal = re.compile('"event":"(' + '|'.join(sorted(LIVE_EVENEMENTS)) + ')"')
 
 live_verrou = threading.RLock()
 live_etat = {}
-live_flags = {'pret': False, 'absente': False, 'sale': False, 'dernier_envoi': 0, 'echecs': 0, 'empreinte': '', 'urgent': False}
+live_flags = {'pret': False, 'absente': False, 'sale': False, 'dernier_envoi': 0, 'echecs': 0, 'empreinte': '', 'urgent': False, 'immediat': False}
 
 
 def live_trace(msg):
@@ -1841,7 +1842,8 @@ def live_nouvel_etat():
         'pied': {'on': False, 'suit': '', 'loadout': '', 'mods': [], 'armes': {}, 'sac': {'data': {}, 'comp': {}, 'items': {}, 'conso': {}}},     # a pied : combinaison, armes, sac a dos
         'minage': live_minage_neuf(),
         'equipage': {},                  # equipage PNJ : identifiant -> {n, g (rang de combat), r (role)}
-        'chasseur': None                 # chasseur du hangar : {n, pc (pilote par le joueur), e : vol | hangar | detruit}
+        'chasseur': None,                # chasseur du hangar : {n, pc (pilote par le joueur), e : vol | hangar | detruit}
+        'saut': None                     # dernier saut hyperespace fait AVEC des passagers a bord : {t (horodatage du journal), sys (destination)} ; la page annonce aux passagers
     }
 
 
@@ -2582,6 +2584,17 @@ def live_mission_acceptee(e, ts, systeme, station):
     }
 
 
+def live_envoi_immediat(ts):
+    """Un evenement qui vient de se produire (pas une relecture d'ancien journal) doit etre envoye sans attendre l'intervalle habituel (sons de la page : saut, embarquement, debarquement)."""
+    t0 = live_ts(ts)
+    if t0 is not None and abs((datetime.now(timezone.utc) - t0).total_seconds()) < 30:
+        live_flags['immediat'] = True
+
+
+def live_est_passagers(m):
+    return bool(m) and m.get('type') in ('passagers', 'exploration') and _bn(m.get('pas')) > 0
+
+
 def live_appliquer(e):
     """Met a jour l'etat de la session avec un evenement du journal. Appelee sous live_verrou."""
     ev = e.get('event')
@@ -2617,6 +2630,11 @@ def live_appliquer(e):
         live_equipage(e)
     elif ev in ('LaunchFighter', 'DockFighter', 'FighterDestroyed', 'FighterRebuilt'):
         live_chasseur(e)
+    elif ev == 'StartJump':
+        # saut vers un autre systeme (hors supercruise et hors taxi) avec une mission de passagers / tourisme en cours : la page passe l'annonce ; envoi immediat s'il vient de se produire
+        if e.get('JumpType') == 'Hyperspace' and not e.get('Taxi') and any(live_est_passagers(m) for m in et['missions'].values()):
+            et['saut'] = {'t': ts, 'sys': live_texte(e.get('StarSystem'))}
+            live_envoi_immediat(ts)
     elif ev == 'LaunchSRV':
         et['minage']['srv'] = str(e.get('SRVType') or '').lower()
     elif ev in ('DockSRV', 'SRVDestroyed'):
@@ -2709,6 +2727,8 @@ def live_appliquer(e):
         if mid is None:
             return
         et['missions'][str(mid)] = live_mission_acceptee(e, ts, et['systeme'], et['station'])
+        if live_est_passagers(et['missions'][str(mid)]):
+            live_envoi_immediat(ts)          # son d'embarquement sans attendre l'intervalle
         if len(et['missions']) > LIVE_MISSIONS_MAX:
             plus_ancienne = sorted(et['missions'].items(), key=lambda kv: str(kv[1].get('t') or ''))[0][0]
             del et['missions'][plus_ancienne]
@@ -2722,6 +2742,8 @@ def live_appliquer(e):
     elif ev == 'MissionCompleted':
         mid = str(e.get('MissionID'))
         m = et['missions'].pop(mid, None)
+        if live_est_passagers(m):
+            live_envoi_immediat(ts)          # son de debarquement des que la mission est rendue
         et['terminees'].append({'id': e.get('MissionID'), 'nom': live_texte(e.get('LocalisedName') or (m or {}).get('nom')), 'faction': live_texte(e.get('Faction')),
                                 'rec': _bn(e.get('Reward')) or _bn(e.get('Donated')), 'type': (m or {}).get('type') or live_type_mission(e.get('Name')), 't': ts})
         if len(et['terminees']) > LIVE_TERMINEES_MAX:
@@ -2994,7 +3016,8 @@ def live_instantane():
             'rang': dict(et['rang']), 'prog': dict(et['prog']), 'pied': live_pied_instantane(et['pied']),
             'minage': live_minage_instantane(et['minage']),
             'explo': explo_instantane(),
-            'equipage': [dict(m) for m in list(et['equipage'].values())[:4]], 'chasseur': dict(et['chasseur']) if et['chasseur'] else None
+            'equipage': [dict(m) for m in list(et['equipage'].values())[:4]], 'chasseur': dict(et['chasseur']) if et['chasseur'] else None,
+            'saut': dict(et['saut']) if et.get('saut') else None
         }
 
 
@@ -3010,10 +3033,16 @@ def live_envoyer(force=False):
             if not (sale or keepalive):
                 return
             base = LIVE_INTERVALLE_ENVOI if live_flags['urgent'] else LIVE_INTERVALLE_MINEUR
-            if maintenant - live_flags['dernier_envoi'] < base * (1 + min(live_flags['echecs'], 8)):
+            # saut hyperespace avec passagers : on n'attend pas l'intervalle (l'annonce doit partir pendant les ~18 s du saut), sauf si les envois echouent
+            # (la base ignore deux envois a moins de 3 s d'ecart : on garde 3,5 s)
+            if live_flags['immediat'] and live_flags['echecs'] == 0:
+                if maintenant - live_flags['dernier_envoi'] < 3.5:
+                    return
+            elif maintenant - live_flags['dernier_envoi'] < base * (1 + min(live_flags['echecs'], 8)):
                 return
         live_flags['sale'] = False
         live_flags['urgent'] = False
+        live_flags['immediat'] = False
     if not get_user_id():
         live_flags['sale'] = True
         live_flags['urgent'] = True
