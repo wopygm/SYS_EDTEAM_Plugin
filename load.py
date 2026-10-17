@@ -22,7 +22,7 @@ except ImportError:
     config = None
 
 plugin_name = "SYS.EDTEAM"
-PLUGIN_VERSION = "2.36"
+PLUGIN_VERSION = "2.37"
 
 SUPABASE_URL = "https://oailvdigfdoyfcydmabb.supabase.co"
 SUPABASE_KEY = "sb_publishable_AASqgRggHdIGttZHPGaWkA_VqrhuYNg"
@@ -3115,6 +3115,7 @@ def live_envoyer(force=False):
 
 LIVE_FSD_CHARGE = 1 << 17           # Status.json, Flags : FSD en charge (la barre de lancement, avant le saut)
 LIVE_SUPERCRUISE = 1 << 4
+LIVE_INTERDIT = 1 << 23             # Status.json, Flags : vaisseau en cours d'interception (mini-jeu)
 
 
 def live_surveiller_fsd(jdir):
@@ -3125,6 +3126,20 @@ def live_surveiller_fsd(jdir):
             flags = int(json.load(f).get('Flags') or 0)
     except Exception:
         return False
+    # interception en cours (Status.json, bit 23 « Being Interdicted ») : le mini-jeu commence, quel que soit l'interdicteur (PNJ ou joueur) ; la page passe l'annonce et les cris
+    intercepte = bool(flags & LIVE_INTERDIT)
+    avant_i = live_flags.get('interdit', False)
+    live_flags['interdit'] = intercepte
+    if intercepte and not avant_i:
+        with live_verrou:
+            et = live_etat
+            pax = any(live_est_passagers(m) for m in et['missions'].values())
+            live_trace('interception (Status.json) : flags=%d passagers=%s en_ligne=%s' % (flags, pax, et['en_ligne']))
+            if et['en_ligne'] and pax:
+                et['interception'] = {'t': datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'), 'e': 'debut'}
+                live_flags['sale'] = True
+                live_flags['immediat'] = True
+                return True
     charge = bool(flags & LIVE_FSD_CHARGE)
     avant = live_flags.get('fsd_charge', False)
     live_flags['fsd_charge'] = charge
