@@ -22,7 +22,7 @@ except ImportError:
     config = None
 
 plugin_name = "SYS.EDTEAM"
-PLUGIN_VERSION = "2.35"
+PLUGIN_VERSION = "2.36"
 
 SUPABASE_URL = "https://oailvdigfdoyfcydmabb.supabase.co"
 SUPABASE_KEY = "sb_publishable_AASqgRggHdIGttZHPGaWkA_VqrhuYNg"
@@ -2758,6 +2758,7 @@ def live_appliquer(e):
         if e.get('BlackMarket'):
             ligne['nm'] = 1
         live_ajouter_registre(ligne)
+        live_envoi_immediat(ts)     # la page joue l'annonce de vente tout de suite (2.36)
     elif ev == 'MissionAccepted':
         mid = e.get('MissionID')
         if mid is None:
