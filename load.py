@@ -22,7 +22,7 @@ except ImportError:
     config = None
 
 plugin_name = "SYS.EDTEAM"
-PLUGIN_VERSION = "2.34"
+PLUGIN_VERSION = "2.35"
 
 SUPABASE_URL = "https://oailvdigfdoyfcydmabb.supabase.co"
 SUPABASE_KEY = "sb_publishable_AASqgRggHdIGttZHPGaWkA_VqrhuYNg"
@@ -1666,7 +1666,8 @@ LIVE_EVENEMENTS = frozenset((
     'LaunchSRV', 'DockSRV', 'SRVDestroyed', 'MiningRefined', 'ProspectedAsteroid', 'LaunchDrone', 'CargoTransfer', 'SAASignalsFound',
     'NpcCrewPaidWage', 'NpcCrewRank', 'CrewAssign', 'CrewHire', 'CrewFire', 'LaunchFighter', 'DockFighter', 'FighterDestroyed', 'FighterRebuilt',
     'FSSDiscoveryScan', 'FSSAllBodiesFound', 'FSSBodySignals', 'Scan', 'SAAScanComplete', 'SellExplorationData', 'MultiSellExplorationData', 'ScanOrganic', 'SellOrganicData',     # exploration + exobiologie (2.30)
-    'StartJump', 'FSDTarget'     # annonce « saut hyperespace » aux passagers (2.33 / 2.34)
+    'StartJump', 'FSDTarget',     # annonce « saut hyperespace » aux passagers (2.33 / 2.34)
+    'ReceiveText', 'Interdicted', 'EscapeInterdiction', 'DataScanned'     # DataScanned : balise de tourisme scannee. Interception en supercruise avec des passagers a bord : annonce + sons de la page (2.35)
 ))
 live_re_journal = re.compile('"event":"(' + '|'.join(sorted(LIVE_EVENEMENTS)) + ')"')
 
@@ -1844,6 +1845,9 @@ def live_nouvel_etat():
         'equipage': {},                  # equipage PNJ : identifiant -> {n, g (rang de combat), r (role)}
         'chasseur': None,                # chasseur du hangar : {n, pc (pilote par le joueur), e : vol | hangar | detruit}
         'cible': None,                   # systeme vise pour le prochain saut (dernier FSDTarget non atteint)
+        'chargement': None,              # dernier transfert de marchandises VERS le vaisseau (ex. soute du Rhino) : {t, n} ; la page joue le son de chargement
+        'tourisme': None,                # derniere balise de tourisme scannee AVEC des passagers a bord : {t, sys} ; la page joue les appareils photo et l'annonce
+        'interception': None,            # derniere interception subie AVEC des passagers a bord : {t, e : debut | echappe | capture} ; la page joue l'annonce et les sons
         'saut': None                     # dernier saut hyperespace fait AVEC des passagers a bord : {t (horodatage du journal), sys (destination)} ; la page annonce aux passagers
     }
 
@@ -2639,6 +2643,23 @@ def live_appliquer(e):
             if t_prec is None or t_now is None or abs((t_now - t_prec).total_seconds()) > 40:
                 et['saut'] = {'t': ts, 'sys': live_texte(e.get('StarSystem'))}
                 live_envoi_immediat(ts)
+    elif ev == 'DataScanned':
+        # balise de tourisme (mission de tourisme) scannee : la page joue les appareils photo, les passagers excites et l'annonce « nous sommes arrives »
+        if 'TouristBeacon' in str(e.get('Type') or '') and any(live_est_passagers(m) for m in et['missions'].values()):
+            et['tourisme'] = {'t': ts, 'sys': et.get('systeme') or ''}
+            live_envoi_immediat(ts)
+    elif ev in ('ReceiveText', 'Interdicted', 'EscapeInterdiction'):
+        # debut : le message radio de l'interdicteur PNJ (« ..._StartInterdiction.. »), ~25 s avant le resultat ; fin : Interdicted (Submitted=false : capture, true : soumission) ou EscapeInterdiction
+        if any(live_est_passagers(m) for m in et['missions'].values()):
+            if ev == 'ReceiveText':
+                etat = 'debut' if 'StartInterdiction' in str(e.get('Message') or '') else None
+            elif ev == 'EscapeInterdiction':
+                etat = 'echappe'
+            else:
+                etat = 'capture'
+            if etat:
+                et['interception'] = {'t': ts, 'e': etat}
+                live_envoi_immediat(ts)
     elif ev == 'LaunchSRV':
         et['minage']['srv'] = str(e.get('SRVType') or '').lower()
     elif ev in ('DockSRV', 'SRVDestroyed'):
@@ -2657,6 +2678,13 @@ def live_appliquer(e):
     elif ev == 'CargoTransfer':
         live_minage_transfert(e)
         live_soute_transfert(e)
+        try:
+            n = sum(_bn(x.get('Count')) for x in (e.get('Transfers') or []) if str(x.get('Direction') or '').lower() == 'toship')
+        except Exception:
+            n = 0
+        if n >= 1:
+            et['chargement'] = {'t': ts, 'n': n}
+            live_envoi_immediat(ts)
     elif ev == 'Cargo':
         if str(e.get('Vessel') or '').upper() == 'SRV' and _bn(e.get('Count')) == 0:
             et['minage']['rhino']['det'] = {}       # soute du VRS vide (transferee, jetee ou perdue)
@@ -3025,7 +3053,10 @@ def live_instantane():
             'minage': live_minage_instantane(et['minage']),
             'explo': explo_instantane(),
             'equipage': [dict(m) for m in list(et['equipage'].values())[:4]], 'chasseur': dict(et['chasseur']) if et['chasseur'] else None,
-            'saut': dict(et['saut']) if et.get('saut') else None
+            'saut': dict(et['saut']) if et.get('saut') else None,
+            'interception': dict(et['interception']) if et.get('interception') else None,
+            'tourisme': dict(et['tourisme']) if et.get('tourisme') else None,
+            'chargement': dict(et['chargement']) if et.get('chargement') else None
         }
 
 
