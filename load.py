@@ -22,7 +22,7 @@ except ImportError:
     config = None
 
 plugin_name = "SYS.EDTEAM"
-PLUGIN_VERSION = "2.33"
+PLUGIN_VERSION = "2.34"
 
 SUPABASE_URL = "https://oailvdigfdoyfcydmabb.supabase.co"
 SUPABASE_KEY = "sb_publishable_AASqgRggHdIGttZHPGaWkA_VqrhuYNg"
@@ -1651,7 +1651,7 @@ def mettre_a_jour_interface(texte, couleur):
 LIVE_INTERVALLE_ENVOI = 30
 LIVE_INTERVALLE_MINEUR = 60     # secondes : simple changement de position (sauts), qui ne merite pas un envoi rapide
 LIVE_KEEPALIVE = 600
-LIVE_MINEURS = frozenset(('FSDJump', 'CarrierJump', 'BackpackChange', 'MiningRefined', 'ProspectedAsteroid', 'LaunchDrone', 'SAASignalsFound'))
+LIVE_MINEURS = frozenset(('FSDTarget', 'FSDJump', 'CarrierJump', 'BackpackChange', 'MiningRefined', 'ProspectedAsteroid', 'LaunchDrone', 'SAASignalsFound'))
 LIVE_REGISTRE_MAX = 30
 LIVE_MISSIONS_MAX = 40
 LIVE_MISSIONS_JOURS = 14     # profondeur de recherche des missions dont la prise est dans une partie precedente
@@ -1666,7 +1666,7 @@ LIVE_EVENEMENTS = frozenset((
     'LaunchSRV', 'DockSRV', 'SRVDestroyed', 'MiningRefined', 'ProspectedAsteroid', 'LaunchDrone', 'CargoTransfer', 'SAASignalsFound',
     'NpcCrewPaidWage', 'NpcCrewRank', 'CrewAssign', 'CrewHire', 'CrewFire', 'LaunchFighter', 'DockFighter', 'FighterDestroyed', 'FighterRebuilt',
     'FSSDiscoveryScan', 'FSSAllBodiesFound', 'FSSBodySignals', 'Scan', 'SAAScanComplete', 'SellExplorationData', 'MultiSellExplorationData', 'ScanOrganic', 'SellOrganicData',     # exploration + exobiologie (2.30)
-    'StartJump'     # annonce « saut hyperespace » aux passagers (2.33)
+    'StartJump', 'FSDTarget'     # annonce « saut hyperespace » aux passagers (2.33 / 2.34)
 ))
 live_re_journal = re.compile('"event":"(' + '|'.join(sorted(LIVE_EVENEMENTS)) + ')"')
 
@@ -1843,6 +1843,7 @@ def live_nouvel_etat():
         'minage': live_minage_neuf(),
         'equipage': {},                  # equipage PNJ : identifiant -> {n, g (rang de combat), r (role)}
         'chasseur': None,                # chasseur du hangar : {n, pc (pilote par le joueur), e : vol | hangar | detruit}
+        'cible': None,                   # systeme vise pour le prochain saut (dernier FSDTarget non atteint)
         'saut': None                     # dernier saut hyperespace fait AVEC des passagers a bord : {t (horodatage du journal), sys (destination)} ; la page annonce aux passagers
     }
 
@@ -2633,8 +2634,11 @@ def live_appliquer(e):
     elif ev == 'StartJump':
         # saut vers un autre systeme (hors supercruise et hors taxi) avec une mission de passagers / tourisme en cours : la page passe l'annonce ; envoi immediat s'il vient de se produire
         if e.get('JumpType') == 'Hyperspace' and not e.get('Taxi') and any(live_est_passagers(m) for m in et['missions'].values()):
-            et['saut'] = {'t': ts, 'sys': live_texte(e.get('StarSystem'))}
-            live_envoi_immediat(ts)
+            # repli : si la charge du FSD (live_surveiller_fsd) a deja declenche l'annonce il y a moins de 40 s, on ne la relance pas
+            t_prec, t_now = live_ts((et.get('saut') or {}).get('t')), live_ts(ts)
+            if t_prec is None or t_now is None or abs((t_now - t_prec).total_seconds()) > 40:
+                et['saut'] = {'t': ts, 'sys': live_texte(e.get('StarSystem'))}
+                live_envoi_immediat(ts)
     elif ev == 'LaunchSRV':
         et['minage']['srv'] = str(e.get('SRVType') or '').lower()
     elif ev in ('DockSRV', 'SRVDestroyed'):
@@ -2668,7 +2672,11 @@ def live_appliquer(e):
         live_sac_complet(e)
     elif ev == 'BackpackChange':
         live_sac_change(e)
+    elif ev == 'FSDTarget':
+        et['cible'] = live_texte(e.get('Name'))         # systeme vise pour le prochain saut (le jeu l'ecrit AVANT l'arrivee pour l'etape suivante d'une route)
     elif ev in ('Location', 'FSDJump', 'CarrierJump'):
+        if ev != 'Location' and et.get('cible') and et['cible'] == live_texte(e.get('StarSystem')):
+            et['cible'] = None                           # cible atteinte (une cible differente = etape suivante deja choisie : on la garde)
         if ev == 'Location' and 'OnFoot' in e:
             et['pied']['on'] = bool(e.get('OnFoot'))
         elif ev != 'Location':
@@ -3073,6 +3081,36 @@ def live_envoyer(force=False):
         live_flags['urgent'] = True
 
 
+LIVE_FSD_CHARGE = 1 << 17           # Status.json, Flags : FSD en charge (la barre de lancement, avant le saut)
+LIVE_SUPERCRUISE = 1 << 4
+
+
+def live_surveiller_fsd(jdir):
+    """Debut de la charge du FSD (le journal ne l'ecrit pas, seul Status.json l'indique) : si des passagers sont a bord et que le saut sera un saut hyperespace
+    (en supercruise, ou en espace normal avec un systeme vise), la page passe l'annonce tout de suite. Renvoie True si l'annonce vient d'etre declenchee."""
+    try:
+        with open(os.path.join(jdir, 'Status.json'), 'r', encoding='utf-8') as f:
+            flags = int(json.load(f).get('Flags') or 0)
+    except Exception:
+        return False
+    charge = bool(flags & LIVE_FSD_CHARGE)
+    avant = live_flags.get('fsd_charge', False)
+    live_flags['fsd_charge'] = charge
+    if not charge or avant:
+        return False
+    with live_verrou:
+        et = live_etat
+        pax = any(live_est_passagers(m) for m in et['missions'].values())
+        hyper = bool(flags & LIVE_SUPERCRUISE) or bool(et.get('cible'))
+        live_trace('charge FSD : flags=%d passagers=%s hyperespace=%s cible=%s' % (flags, pax, hyper, et.get('cible')))
+        if not (et['en_ligne'] and pax and hyper):
+            return False
+        et['saut'] = {'t': datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'), 'sys': et.get('cible') or ''}
+        live_flags['sale'] = True
+        live_flags['immediat'] = True
+    return True
+
+
 def live_boucle():
     while True:
         try:
@@ -3088,7 +3126,15 @@ def live_boucle():
             live_envoyer()
         except Exception as ex:
             live_trace('envoi : %r' % (ex,))
-        time.sleep(2)
+        # pendant les 2 s d'attente : surveillance de la charge du FSD (un petit fichier lu 4 fois par passe, seulement en jeu)
+        jdir = trouver_journal_dir() if live_etat.get('en_ligne') else None
+        for _ in range(4):
+            try:
+                if jdir and live_surveiller_fsd(jdir):
+                    live_envoyer()
+            except Exception as ex:
+                live_trace('surveillance FSD : %r' % (ex,))
+            time.sleep(0.5)
 
 
 def heartbeat_loop():
