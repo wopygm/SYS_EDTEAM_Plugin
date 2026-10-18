@@ -22,7 +22,7 @@ except ImportError:
     config = None
 
 plugin_name = "SYS.EDTEAM"
-PLUGIN_VERSION = "2.37"
+PLUGIN_VERSION = "2.38"
 
 SUPABASE_URL = "https://oailvdigfdoyfcydmabb.supabase.co"
 SUPABASE_KEY = "sb_publishable_AASqgRggHdIGttZHPGaWkA_VqrhuYNg"
@@ -35,7 +35,6 @@ dernier_solde_fc = None
 cached_user_id = None
 invalid_api_key = False
 dernier_solde_vaisseau = None
-dernier_etat_cible = "LOST"
 dernier_faction_escadron_envoyee = None
 
 # Cache pilote (Egress shield : 600s)
@@ -1658,6 +1657,8 @@ LIVE_MISSIONS_JOURS = 14     # profondeur de recherche des missions dont la pris
 live_inconnues = set()       # missions de la liste « Missions » du jeu dont on ne connait pas encore les details
 live_essayees = set()        # missions deja cherchees dans les anciens journaux (on ne les relit pas a chaque passe)
 LIVE_TERMINEES_MAX = 30
+CMB_SEULS = frozenset(('ShipTargeted', 'Bounty', 'FactionKillBond', 'PVPKill', 'Died', 'Resurrect', 'UnderAttack', 'ShieldState', 'HullDamage', 'UseConsumable', 'RedeemVoucher',
+                       'SupercruiseDestinationDrop', 'ApproachSettlement', 'CommitCrime'))     # onglet Combat (2.38) : traites par cmb_traiter, envoyes a part (SQL 103)
 LIVE_EVENEMENTS = frozenset((
     'Fileheader', 'LoadGame', 'Loadout', 'Location', 'FSDJump', 'CarrierJump', 'Docked', 'Undocked',
     'MarketBuy', 'MarketSell', 'Cargo', 'MissionAccepted', 'MissionCompleted', 'MissionFailed',
@@ -1668,7 +1669,7 @@ LIVE_EVENEMENTS = frozenset((
     'FSSDiscoveryScan', 'FSSAllBodiesFound', 'FSSBodySignals', 'Scan', 'SAAScanComplete', 'SellExplorationData', 'MultiSellExplorationData', 'ScanOrganic', 'SellOrganicData',     # exploration + exobiologie (2.30)
     'StartJump', 'FSDTarget',     # annonce « saut hyperespace » aux passagers (2.33 / 2.34)
     'ReceiveText', 'Interdicted', 'EscapeInterdiction', 'DataScanned'     # DataScanned : balise de tourisme scannee. Interception en supercruise avec des passagers a bord : annonce + sons de la page (2.35)
-))
+)) | CMB_SEULS
 live_re_journal = re.compile('"event":"(' + '|'.join(sorted(LIVE_EVENEMENTS)) + ')"')
 
 live_verrou = threading.RLock()
@@ -2577,6 +2578,16 @@ def explo_demarrer(jdir, fichiers):
     explo_sauver_si_besoin()
 
 
+def live_mission_combat(e):
+    """'M' : massacre / assaut (nombre d'ennemis d'une faction) ; 'A' : assassinat (une cible nommee) ; '' sinon."""
+    n = str(e.get('Name') or '').lower()
+    if 'assassin' in n:
+        return 'A'
+    if 'massacre' in n or 'onslaught' in n:
+        return 'M'
+    return ''
+
+
 def live_mission_acceptee(e, ts, systeme, station):
     """Mission telle qu'elle est enregistree a sa prise (evenement MissionAccepted) ; systeme / station = ou le pilote se trouvait."""
     return {
@@ -2585,7 +2596,8 @@ def live_mission_acceptee(e, ts, systeme, station):
         'rec': e.get('Reward'), 'q': _bn(e.get('Count')), 'march': live_texte(e.get('Commodity_Localised')), 'pas': _bn(e.get('PassengerCount')),
         'vip': 1 if e.get('PassengerVIPs') else 0, 'rech': 1 if e.get('PassengerWanted') else 0, 'ptype': live_texte(e.get('PassengerType')),
         'don': _bn(e.get('Donation')), 'inf': e.get('Influence'), 'rep': e.get('Reputation'), 't': ts,
-        'os': systeme, 'ost': station     # ou la mission a ete prise (pour le retour au commanditaire)
+        'os': systeme, 'ost': station,    # ou la mission a ete prise (pour le retour au commanditaire)
+        'cm': live_mission_combat(e), 'kc': _bn(e.get('KillCount')), 'tf': live_texte(e.get('TargetFaction')), 'tg': live_texte(e.get('Target')) if live_mission_combat(e) == 'A' else ''     # combat : M massacre, A assassinat
     }
 
 
@@ -2605,9 +2617,14 @@ def live_appliquer(e):
     ev = e.get('event')
     ts = str(e.get('timestamp') or '')
     et = live_etat
+    if ev in CMB_SEULS:
+        cmb_traiter(e)                    # combat : etat propre, envoi a part ; ne marque PAS la session en direct comme modifiee (pas d'envoi de ~9 Ko a chaque tir)
+        return
     if ev in EXPLO_EVENEMENTS:
         explo_traiter(e)                  # exploration : etat propre (explo_mem), conserve d'un lancement a l'autre
     if ev == 'Fileheader':
+        cmb_traiter(e)                    # nouvelle partie : les primes et bons non encaisses repartent de zero
+
         if _bn(e.get('part') or 1) <= 1:
             et.update(live_nouvel_etat())
             et['debut'] = ts
@@ -2692,8 +2709,10 @@ def live_appliquer(e):
             et['soute_vaisseau'] = {'Vessel': 'Ship', 'Inventory': e.get('Inventory')}
     elif ev == 'Disembark':
         live_etat['pied']['on'] = True      # on descend (du vaisseau, du SRV, d'un taxi ou d'un equipage) : a pied dans tous les cas
+        cmb_changement_posture(True)
     elif ev == 'Embark':
         live_etat['pied']['on'] = False
+        cmb_changement_posture(False)
     elif ev == 'SuitLoadout':
         live_costume(e)
     elif ev == 'Backpack':
@@ -2716,6 +2735,14 @@ def live_appliquer(e):
         amarre = bool(e.get('Docked')) if ev != 'FSDJump' else False
         et['amarre'] = amarre
         et['station'] = live_texte(e.get('StationName')) if amarre else ''
+        try:        # reputation aupres des factions du systeme (MyReputation) : cible « amie » hors zone de conflit
+            cmb_g['rep'] = {'sys': live_texte(e.get('StarSystem')), 'm': {str(f.get('Name')): int(round(float(f.get('MyReputation')))) for f in (e.get('Factions') or []) if f.get('Name') and f.get('MyReputation') is not None}}
+        except Exception:
+            pass
+        try:        # factions en guerre dans ce systeme (Conflicts) : aussi a la relecture, pour que l'onglet Combat connaisse la zone apres un redemarrage d'EDMC
+            cmb_g['conf'] = {'sys': live_texte(e.get('StarSystem')), 'paires': [[(c.get('Faction1') or {}).get('Name', ''), (c.get('Faction2') or {}).get('Name', '')] for c in (e.get('Conflicts') or []) if str(c.get('Status', '')).lower() != 'pending' and (c.get('Faction1') or {}).get('Name') and (c.get('Faction2') or {}).get('Name')]}
+        except Exception:
+            pass
     elif ev == 'Docked':
         et['amarre'] = True
         et['station'] = live_texte(e.get('StationName'))
@@ -3061,6 +3088,445 @@ def live_instantane():
         }
 
 
+# =====================================================================================================
+# COMBAT (onglet « COMBAT » du tableau de bord, script SQL 103) : session de combat, cible verrouillee, morts, primes, bons de guerre.
+# Etat en MEMOIRE (cmb, cmb_g), alimente par les evenements du journal (cmb_traiter, sous live_verrou) et par Status.json (cmb_status).
+# Il part dans SA PROPRE petite ligne (RPC combat_releve), pas dans l'instantane de la session : un envoi rapide (4 s) ne renvoie donc pas les ~9 Ko de la session.
+# Une session de combat commence au premier mort, a la premiere attaque subie ou a la premiere mort du pilote, et finit apres 10 minutes sans evenement de combat.
+# Diagnostic : live_debug.txt (meme fichier que la session en direct).
+# =====================================================================================================
+CMB_FIN_SESSION = 600           # secondes sans evenement de combat : la session est terminee
+CMB_ENVOI_MIN = 4               # secondes entre deux envois pendant un VRAI combat (le premier changement part tout de suite, le suivant attend ce delai)
+CMB_ENVOI_VERROU = 8            # idem pour un simple verrouillage de cible (supercruise, hors combat)
+CMB_ENVOI_LENT = 20             # delai quand plus de CMB_PLAFOND_HEURE envois ont deja eu lieu dans l'heure (protege le quota Supabase)
+CMB_PLAFOND_HEURE = 600
+cmb_envois = []                 # horodatages des envois de la derniere heure
+CMB_KILLS_VAISSEAU = 40
+CMB_KILLS_PIED = 120
+CMB_NOMS_PIED = 40
+CMB_JOURNAL_MAX = 30
+CMB_PVP_DUREE = 180             # secondes : apres un signe de PvP (joueur verrouille, tue ou meurtrier), la session reste en mode PvP tant que le combat continue contre lui
+CMB_VUS_MAX = 8
+
+cmb = {'s': None}               # session courante (ou la derniere, terminee)
+cmb_g = {'pend_p': 0, 'pend_b': 0, 'cible': None, 'bo': True, 'co': None, 'arm': False, 'fg': 0, 'pips': None, 'sante': None, 'imp': 0, 'attaque': 0,
+         'lieu': '', 'lieu_sys': '', 'zi': '', 'zn': '', 'zsys': '', 'vus': {}, 'mprog': {},
+         'sale': False, 'dernier_envoi': 0.0, 'echecs': 0, 'absente': False, 'empreinte': '', 'fin_a_envoyer': False}
+
+
+def cmb_nom(s):
+    s = live_texte(s)
+    m = re.search(r'#name=([^;]*);', s)
+    s = (m.group(1) if m else s).strip()
+    s = re.sub(r'\$[A-Za-z0-9_]+;\s*', '', s).strip()     # '$ShipName_General; Fearless Blaze' -> 'Fearless Blaze'
+    return re.sub(r'^CMD\s+', '', s)                       # 'CMD Dupont' -> 'Dupont' (la page ajoute CMD pour un joueur)
+
+
+def cmb_actif():
+    s = cmb['s']
+    return bool(s and s['actif'])
+
+
+def cmb_marquer():
+    """Quelque chose a change : envoi a prevoir, mais seulement pendant un combat (sinon rien ne part)."""
+    if cmb_actif():
+        cmb_g['sale'] = True
+
+
+def cmb_journal(s, t, code, texte):
+    s['jr'].append([int(t - s['t0']), code, texte])
+    if len(s['jr']) > CMB_JOURNAL_MAX:
+        del s['jr'][:len(s['jr']) - CMB_JOURNAL_MAX]
+
+
+def cmb_changement_posture(pied):
+    """Embarquement / debarquement : la session de combat en cours (vaisseau ou a pied) est terminee, le prochain combat en ouvre une nouvelle. Appelee sous live_verrou."""
+    try:
+        s = cmb['s']
+        if s and s['actif'] and bool(s['pied']) != bool(pied):
+            s['actif'] = False
+            cmb_g['fin_a_envoyer'] = True
+            cmb_g['sale'] = True
+            live_trace('combat : session terminee (changement de posture, %d morts)' % s['nb'])
+    except Exception:
+        pass
+
+
+def cmb_session(t, ts):
+    """Session de combat en cours (en ouvre une nouvelle au premier evenement de combat, ou apres 10 minutes de silence)."""
+    s = cmb['s']
+    if s and s['actif'] and (t - s['dernier'] > CMB_FIN_SESSION or bool(s['pied']) != bool(live_etat['pied'].get('on'))):
+        s['actif'] = False                  # silence de 10 min, ou autre posture (vaisseau <-> a pied) : nouvelle session
+        s = None
+    if s is None or not s['actif']:
+        s = {'actif': True, 'debut': ts, 't0': t, 'dernier': t, 'mode': '', 'pvp': 0.0, 'pied': False, 'kills': [], 'nb': 0, 'primes': 0, 'bons': 0, 'bt': 0,
+             'deces': 0, 'med': 0, 'dg': 0, 'dp': 0, 'vic': [], 'dir': None, 'soutien': '', 'ennemi': '', 'jr': []}
+        cmb['s'] = s
+        cmb_g['co'] = None
+        cmb_g['fin_a_envoyer'] = False
+        live_trace('combat : session ouverte (%s)' % ts)
+    s['dernier'] = t
+    s['pied'] = bool(live_etat['pied'].get('on'))
+    cmb_g['sale'] = True
+    return s
+
+
+def cmb_cible_morte(nom, faction, t, recompense):
+    c = cmb_g['cible']
+    if c and not c.get('m'):
+        if (nom and c.get('p') == nom) or (not nom and faction and c.get('f') == faction and t - c.get('t', 0) < 30):
+            c['m'] = 1
+            c['mr'] = int(recompense or 0)
+    if c and c.get('m'):
+        cmb_g['vus'].pop(str(c.get('s')) + '|' + str(c.get('p')), None)
+    if nom:
+        for k in [k for k in cmb_g['vus'] if k.endswith('|' + nom)]:
+            cmb_g['vus'].pop(k, None)
+
+
+def cmb_progres_missions(faction, nom):
+    """Avancement estime des missions de massacre (kills de la faction visee) et d'assassinat (nom de la cible) depuis leur acceptation."""
+    for m in live_etat['missions'].values():
+        cm = m.get('cm')
+        if not cm:
+            continue
+        mid = str(m.get('id'))
+        if cm == 'M' and faction and live_texte(m.get('tf')).lower() == faction.lower():
+            cmb_g['mprog'][mid] = cmb_g['mprog'].get(mid, 0) + 1
+        elif cm == 'A' and nom and live_texte(m.get('tg')).lower() == nom.lower():
+            cmb_g['mprog'][mid] = 1
+
+
+def cmb_kill(s, t, cle, nom, faction, recompense, code):
+    s['nb'] += 1
+    s['kills'].append([int(t - s['t0']), cle, nom, faction, int(recompense or 0), code])
+    if len(s['kills']) > CMB_KILLS_PIED:
+        del s['kills'][:len(s['kills']) - CMB_KILLS_PIED]
+    cmb_cible_morte(nom, faction if code == 'G' else '', t, recompense)
+    cmb_progres_missions(faction, nom)
+
+
+def cmb_traiter(e):
+    """Un evenement du journal. Appelee sous live_verrou ; ne fait aucun appel reseau."""
+    ev = e.get('event')
+    ts = str(e.get('timestamp') or '')
+    t0 = live_ts(ts)
+    if t0 is None:
+        return
+    t = t0.timestamp()
+    g = cmb_g
+    if ev == 'Fileheader':
+        if _bn(e.get('part') or 1) <= 1:
+            g['pend_p'] = g['pend_b'] = 0          # les bons non encaisses sont comptes depuis le lancement du jeu
+            g['vus'].clear()
+            g['cible'] = None
+    elif ev == 'ShipTargeted':
+        if not e.get('TargetLocked'):
+            g['cible'] = None
+        else:
+            nom = cmb_nom(e.get('PilotName_Localised') or e.get('PilotName'))
+            joueur = str(e.get('PilotName') or '').startswith('$cmdr_decorate')
+            c = {'s': str(e.get('Ship') or '').lower(), 'sl': live_texte(e.get('Ship_Localised') or e.get('Ship')), 'st': _bn(e.get('ScanStage')), 'p': nom,
+                 'rg': live_texte(e.get('PilotRank')), 'f': live_texte(e.get('Faction')), 'l': live_texte(e.get('LegalStatus')), 'j': 1 if joueur else 0,
+                 'e': live_texte(e.get('SquadronID')), 'pw': live_texte(e.get('Power')), 'po': 1 if 'police' in str(e.get('PilotName') or '').lower() else 0, 't': int(t)}
+            for src, dst in (('ShieldHealth', 'sh'), ('HullHealth', 'hu')):
+                if e.get(src) is not None:
+                    try:
+                        c[dst] = int(round(float(e.get(src))))
+                    except Exception:
+                        pass
+            if e.get('Bounty') is not None:
+                c['pm'] = _bn(e.get('Bounty'))
+            ss = live_texte(e.get('SubSystem_Localised') or e.get('SubSystem'))
+            if ss:
+                c['ss'] = ss
+            g['cible'] = c
+            if nom and c['st'] >= 2:
+                dr = cmb_g.setdefault('dern', [])         # derniers vaisseaux scannes (pour rattacher un bon de guerre a un vaisseau : le bon ne donne que la faction)
+                if not any(d['s'] == c['s'] and d['p'] == nom and d['f'] == c['f'] and not d['u'] for d in dr) or c['f']:
+                    dr[:] = [d for d in dr if not (d['s'] == c['s'] and d['p'] == nom and not d['u'])]
+                    dr.append({'s': c['s'], 'p': nom, 'rg': c['rg'], 'f': c['f'], 't': int(t), 'u': False})
+                    del dr[:-10]
+                cle_v = c['s'] + '|' + nom          # un vaisseau + un pilote (les PNJ d'une meme flotte portent tous le meme nom)
+                g['vus'].pop(cle_v, None)           # remis a la fin : le plus recent
+                g['vus'][cle_v] = {'s': c['s'], 'sl': c['sl'], 'p': nom, 'rg': c['rg'], 'j': c['j'], 'f': c['f'], 'l': c['l'], 'pw': c['pw'], 'po': c['po'], 't': int(t)}
+                if len(g['vus']) > CMB_VUS_MAX:
+                    g['vus'].pop(next(iter(g['vus'])))
+            if not cmb_actif():       # toute cible verrouillee (supercruise comprise, armes rentrees) ouvre la vue ; la page ne bascule d'onglet que pour un vrai combat (champ cb)
+                cmb_session(t, ts)
+            if joueur and cmb_actif():
+                cmb['s']['pvp'] = t         # dernier signe de PvP (horodatage) : le mode PvP ne dure que quelques minutes apres
+        cmb_marquer()
+    elif ev == 'CommitCrime':
+        if str(e.get('CrimeType') or '').lower() in ('assault', 'murder'):         # agression contre un vaisseau : la cible devient hostile pour nous
+            ag = g.setdefault('agr', [])
+            ag.append([cmb_nom(e.get('Victim')), live_texte(e.get('Faction')), int(t)])
+            del ag[:-8]
+            cmb_marquer()
+    elif ev == 'ApproachSettlement':
+        g['lieu'] = live_texte(e.get('Name'))
+        g['lieu_sys'] = live_etat['systeme']
+    elif ev == 'SupercruiseDestinationDrop':
+        typ = str(e.get('Type') or '').lower()
+        if 'warzone' in typ or 'conflict' in typ:
+            g['zi'] = 'H' if 'high' in typ else 'M' if 'med' in typ else 'S'
+            g['zn'] = live_texte(e.get('Type_Localised'))
+            g['zsys'] = live_etat['systeme']
+    elif ev == 'Bounty':
+        s = cmb_session(t, ts)
+        nom = cmb_nom(e.get('PilotName_Localised') or e.get('PilotName'))
+        rec = _bn(e.get('TotalReward')) or sum(_bn(r.get('Reward')) for r in (e.get('Rewards') or []) if isinstance(r, dict))
+        faction = live_texte(e.get('VictimFaction'))
+        s['primes'] += rec
+        g['pend_p'] += rec
+        s['mode'] = 'secu'
+        if faction:
+            s['ennemi'] = faction
+        cmb_kill(s, t, str(e.get('Target') or '').lower(), nom, faction, rec, 'B')
+        cmb_journal(s, t, 'x', (nom or live_texte(e.get('Target_Localised') or e.get('Target'))) + ' éliminé · ' + format(rec, ',').replace(',', ' ') + ' cr')
+    elif ev == 'FactionKillBond':
+        s = cmb_session(t, ts)
+        rec = _bn(e.get('Reward'))
+        faction = live_texte(e.get('VictimFaction'))
+        s['bons'] += rec
+        g['pend_b'] += rec
+        s['mode'] = 'guerre'
+        s['soutien'] = live_texte(e.get('AwardingFaction')) or s['soutien']
+        if faction:
+            s['ennemi'] = faction
+        cle_g, rg_g = '', ''
+        for d in reversed(g.get('dern', [])):         # dernier vaisseau scanne de la faction tuee, pas deja attribue, vu il y a 90 s au plus
+            if (not d['u']) and d['f'] and d['f'].lower() == faction.lower() and t - d['t'] <= 90:
+                d['u'] = True
+                cle_g, rg_g = d['s'], d['rg']
+                break
+        cmb_kill(s, t, cle_g, rg_g, faction, rec, 'G')
+        if s['nb'] % 5 == 1 and not s['pied']:
+            cmb_journal(s, t, 'x', 'Ennemi éliminé · ' + faction)
+    elif ev == 'PVPKill':
+        s = cmb_session(t, ts)
+        s['pvp'] = t
+        s['dg'] += 1
+        nom = live_texte(e.get('Victim'))
+        cmb_kill(s, t, 'pvp', nom, '', _bn(e.get('CombatRank')), 'P')
+        cmb_journal(s, t, 'x', 'CMD ' + nom + ' éliminé')
+    elif ev == 'Died':
+        s = cmb_session(t, ts)
+        s['deces'] += 1
+        tueurs = e.get('Killers') if isinstance(e.get('Killers'), list) and e.get('Killers') else [e]
+        texte = []
+        for k in tueurs[:2]:
+            nom = live_texte(k.get('KillerName') or k.get('Name'))
+            if nom.lower().startswith('cmdr'):
+                s['pvp'] = t
+                s['dp'] += 1
+            texte.append((nom or '?') + (' · ' + live_texte(k.get('KillerShip') or k.get('Ship')) if (k.get('KillerShip') or k.get('Ship')) else '') + (' · ' + live_texte(k.get('KillerRank') or k.get('Rank')) if (k.get('KillerRank') or k.get('Rank')) else ''))
+        cmb_journal(s, t, 'd', 'Détruit par ' + ' ; '.join(texte))
+    elif ev == 'UnderAttack':
+        g['attaque'] = t
+        cmb_session(t, ts)
+    elif ev == 'ShieldState':
+        up = bool(e.get('ShieldsUp'))
+        avant = g['bo']
+        g['bo'] = up
+        if cmb_actif() or (t - g['attaque'] < 60):
+            s = cmb_session(t, ts)
+            if avant and not up:
+                s['bt'] += 1
+                cmb_journal(s, t, 'b', 'Bouclier tombé')
+            elif up and not avant:
+                cmb_journal(s, t, 'b', 'Bouclier rétabli')
+    elif ev == 'HullDamage':
+        if e.get('PlayerPilot') and not e.get('Fighter'):
+            try:
+                g['co'] = max(0, min(100, int(round(float(e.get('Health')) * 100))))
+            except Exception:
+                pass
+            g['imp'] = int(t)
+            cmb_marquer()
+    elif ev == 'UseConsumable':
+        if cmb_actif() and 'health' in str(e.get('Name') or '').lower():
+            cmb['s']['med'] += 1
+            cmb['s']['dernier'] = t
+            cmb_journal(cmb['s'], t, 'i', 'Médikit utilisé')
+            cmb_marquer()
+    elif ev == 'RedeemVoucher':
+        montant = _bn(e.get('Amount'))
+        typ = str(e.get('Type') or '').lower()
+        if typ == 'bounty':
+            g['pend_p'] = max(0, g['pend_p'] - montant)
+        elif 'bond' in typ:
+            g['pend_b'] = max(0, g['pend_b'] - montant)
+        cmb_marquer()
+
+
+def cmb_victoire(intensite, connue, ordre):
+    """Victoire en zone de conflit comptee par la partie « zone de conflit » du plugin (journal_entry) ; ordre = directive BGS GUERRE rattachee, ou None."""
+    try:
+        with live_verrou:
+            t = time.time()
+            ts = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+            s = cmb_session(t, ts)
+            s['vic'].append(intensite if connue else '')
+            if ordre:
+                d = s['dir'] or {'n': 0}
+                d.update({'sys': live_texte(ordre.get('systeme_cible')), 'f': live_texte(ordre.get('faction_cible'))})
+                d['n'] += 1
+                s['dir'] = d
+            cmb_journal(s, t, 'v', 'Victoire en zone de conflit' + ({'H': ' (forte intensité)', 'M': ' (intensité moyenne)', 'S': ' (faible intensité)'}.get(intensite, '') if connue else ''))
+    except Exception as ex:
+        live_trace('combat : victoire ignoree %r' % (ex,))
+
+
+def cmb_status(js):
+    """Status.json : boucliers, armes sorties, groupe de tir, sante a pied. Appelee souvent (toutes les 0,5 s) : ne marque l'etat modifie que si quelque chose change."""
+    try:
+        flags = int(js.get('Flags') or 0)
+    except Exception:
+        return
+    g = cmb_g
+    change = False
+    arm = bool(flags & (1 << 6))
+    fg = int(js.get('FireGroup') or 0)
+    pips = js.get('Pips') if isinstance(js.get('Pips'), list) and len(js.get('Pips')) == 3 else None
+    sante = None
+    if js.get('Health') is not None:
+        try:
+            sante = int(round(float(js.get('Health')) * 100))
+        except Exception:
+            sante = None
+    if flags & (1 << 24):                      # aux commandes du vaisseau : Status.json donne l'etat des boucliers
+        bo = bool(flags & (1 << 3))
+        if bo != g['bo']:
+            g['bo'] = bo
+            change = True
+    if arm != g['arm'] or fg != g['fg'] or sante != g['sante']:
+        change = True
+    if arm and not g['arm'] and g['cible'] and not g['cible'].get('m') and not cmb_actif():      # armes sorties alors qu'une cible est deja verrouillee
+        with live_verrou:
+            cmb_session(time.time(), datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'))
+    ls = str(js.get('LegalState') or '')
+    if ls != g.get('ls', ''):
+        g['ls'] = ls
+        change = True
+    g['arm'], g['fg'], g['pips'], g['sante'] = arm, fg, pips, sante
+    if change:
+        cmb_marquer()
+
+
+def cmb_missions():
+    res = []
+    for m in live_etat['missions'].values():
+        if not m.get('cm'):
+            continue
+        res.append({'id': m.get('id'), 'ty': m['cm'], 'tf': live_texte(m.get('tf')), 'tg': live_texte(m.get('tg')), 'n': _bn(m.get('kc')),
+                    'k': cmb_g['mprog'].get(str(m.get('id')), 0), 'st': live_texte(m.get('st')), 'sys': live_texte(m.get('sys')), 'rec': m.get('rec'), 'exp': m.get('exp'),
+                    'nom': live_texte(m.get('nom'))[:60]})
+    return res[:3]
+
+
+def cmb_instantane():
+    """Instantane du combat (petit : quelques Ko). Appelee sous live_verrou."""
+    s, g = cmb['s'], cmb_g
+    pied = bool(live_etat['pied'].get('on'))
+    kills = list(s['kills'][-(CMB_KILLS_PIED if s['pied'] else CMB_KILLS_VAISSEAU):])
+    if s['pied'] and len(kills) > CMB_NOMS_PIED:
+        for k in kills[:-CMB_NOMS_PIED]:
+            k[2] = ''
+    cible = dict(g['cible']) if g['cible'] else None
+    if cible:
+        for m in live_etat['missions'].values():
+            cm = m.get('cm')
+            if (cm == 'M' and cible.get('f') and live_texte(m.get('tf')).lower() == cible['f'].lower()) or (cm == 'A' and cible.get('p') and live_texte(m.get('tg')).lower() == cible['p'].lower()):
+                cible['mi'] = 1
+    zi = g['zi'] if (g['zsys'] and g['zsys'] == live_etat['systeme']) else ''
+    vus = [dict(v) for v in g['vus'].values() if s and int(s['dernier']) - v['t'] < CMB_FIN_SESSION][-6:]
+    conf = g.get('conf')
+    cf_zone = conf['paires'] if conf and conf.get('sys') == live_etat['systeme'] else []       # factions en guerre dans ce systeme (Conflicts du journal)
+    rp = g.get('rep')
+    rp_zone = rp['m'] if rp and rp.get('sys') == live_etat['systeme'] else {}                   # reputation aupres des factions du systeme
+    ag_recent = [[a[0], a[1]] for a in g.get('agr', []) if time.time() - a[2] < 600]
+    cb_reel = cmb_reel(s, g)
+    return {
+        'v': 1, 'actif': bool(s['actif']), 'debut': s['debut'], 'maj': datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'),
+        'mode': 'pvp' if (s['pvp'] and s['dernier'] - s['pvp'] < CMB_PVP_DUREE) else (s['mode'] or 'secu'), 'pied': bool(s['pied']), 'sys': live_etat['systeme'],
+        'lieu': g['lieu'] if g['lieu_sys'] == live_etat['systeme'] else '', 'zi': zi, 'zn': g['zn'] if zi else '',
+        'soutien': s['soutien'], 'ennemi': s['ennemi'], 'cf': cf_zone, 'fe': dernier_faction_escadron_envoyee or '', 'pw': pp_etat.get('puissance') or '', 'rp': rp_zone, 'ag': ag_recent, 'ls': g.get('ls', ''), 'cb': 1 if cb_reel else 0, 'nb': s['nb'], 'primes': s['primes'], 'bons': s['bons'],
+        'pend': [g['pend_p'], g['pend_b']], 'vic': list(s['vic']), 'dir': dict(s['dir']) if s['dir'] else None, 'bt': s['bt'], 'deces': s['deces'], 'med': s['med'],
+        'duels': [s['dg'], s['dp']], 'kills': kills, 'cible': cible, 'vus': vus,
+        'moi': {'bo': bool(g['bo']), 'co': g['co'], 'arm': bool(g['arm']), 'fg': g['fg'], 'pips': g['pips'], 'sante': g['sante'], 'imp': g['imp']},
+        'miss': cmb_missions(), 'jr': list(s['jr']), 't0': int(s['t0']), 'fin': int(s['dernier'])
+    }
+
+
+def cmb_reel(s, g):
+    """Vrai combat (elimination, attaque, bouclier, mort, victoire, armes sorties) par opposition a un simple verrouillage de cible."""
+    return bool(s['nb'] or s['deces'] or s['bt'] or s['dg'] or s['dp'] or s['vic'] or g['arm'] or (g['attaque'] and g['attaque'] >= s['t0']))
+
+
+def cmb_delai(s, g, maintenant):
+    """Delai minimal avant le prochain envoi : 4 s en combat, 8 s pour un simple verrouillage, 20 s au-dela de 600 envois par heure."""
+    cmb_envois[:] = [x for x in cmb_envois if maintenant - x < 3600]
+    base = CMB_ENVOI_MIN if cmb_reel(s, g) else CMB_ENVOI_VERROU
+    if len(cmb_envois) >= CMB_PLAFOND_HEURE:
+        base = max(base, CMB_ENVOI_LENT)
+    return base
+
+
+def cmb_envoyer():
+    """Envoie l'etat du combat si quelque chose a change (au plus un envoi toutes les 4 s) ; un dernier envoi quand la session se termine. Rien ne part hors combat."""
+    g = cmb_g
+    if g['absente'] or not live_flags['pret']:
+        return
+    maintenant = time.time()
+    with live_verrou:
+        s = cmb['s']
+        if s and s['actif'] and (maintenant - s['dernier'] > CMB_FIN_SESSION or not live_etat['en_ligne']):
+            s['actif'] = False                 # silence de 10 minutes, ou jeu ferme : fin de la session
+            g['fin_a_envoyer'] = True
+            g['sale'] = True
+            live_trace('combat : session terminee (%d morts)' % s['nb'])
+        if not s or not (g['sale'] and (s['actif'] or g['fin_a_envoyer'])):
+            return
+        if maintenant - g['dernier_envoi'] < cmb_delai(s, g, maintenant) * (1 + min(g['echecs'], 8)):
+            return
+        g['sale'] = False
+        fin = g['fin_a_envoyer']
+        g['fin_a_envoyer'] = False
+        snap = cmb_instantane()
+    if not get_user_id():
+        g['sale'] = True
+        g['dernier_envoi'] = maintenant
+        return
+    sans_maj = dict(snap)
+    sans_maj.pop('maj', None)
+    empreinte = hashlib.md5(json.dumps(sans_maj, sort_keys=True, ensure_ascii=False).encode('utf-8')).hexdigest()
+    if empreinte == g['empreinte'] and not fin:
+        return
+    g['dernier_envoi'] = maintenant
+    cmb_envois.append(maintenant)
+    try:
+        res = requests.post(f"{SUPABASE_URL}/rest/v1/rpc/combat_releve", headers=get_headers(), json={'p_etat': snap}, timeout=10)
+        live_trace('combat_releve : %d octets -> HTTP %s %s' % (len(json.dumps(snap)), res.status_code, (res.text or '')[:160]))
+        if res.status_code in (200, 201, 204):
+            g['empreinte'] = empreinte
+            g['echecs'] = 0
+            return
+        if res.status_code == 404:
+            g['absente'] = True                # fonction pas encore creee en base : on ne reessaie pas
+            return
+        raise RuntimeError('HTTP ' + str(res.status_code))
+    except Exception as ex:
+        live_trace('combat : envoi en echec %r' % (ex,))
+        g['echecs'] += 1
+        g['sale'] = True
+        if fin:
+            g['fin_a_envoyer'] = True
+# =====================================================================================================
+# FIN COMBAT
+# =====================================================================================================
+
+
 def live_envoyer(force=False):
     """Envoie l'instantane si quelque chose a change (au plus un envoi toutes les 30 s, plus espace apres des echecs) ; un envoi de securite toutes les 5 minutes en jeu."""
     if live_flags['absente'] or not live_flags['pret']:
@@ -3123,9 +3589,14 @@ def live_surveiller_fsd(jdir):
     (en supercruise, ou en espace normal avec un systeme vise), la page passe l'annonce tout de suite. Renvoie True si l'annonce vient d'etre declenchee."""
     try:
         with open(os.path.join(jdir, 'Status.json'), 'r', encoding='utf-8') as f:
-            flags = int(json.load(f).get('Flags') or 0)
+            js = json.load(f)
+        flags = int(js.get('Flags') or 0)
     except Exception:
         return False
+    try:
+        cmb_status(js)                # onglet Combat : boucliers, armes sorties, groupe de tir, sante a pied
+    except Exception as ex:
+        live_trace('combat : status ignore %r' % (ex,))
     # interception en cours (Status.json, bit 23 « Being Interdicted ») : le mini-jeu commence, quel que soit l'interdicteur (PNJ ou joueur) ; la page passe l'annonce et les cris
     intercepte = bool(flags & LIVE_INTERDIT)
     avant_i = live_flags.get('interdit', False)
@@ -3173,12 +3644,18 @@ def live_boucle():
             live_envoyer()
         except Exception as ex:
             live_trace('envoi : %r' % (ex,))
+        try:
+            cmb_envoyer()
+        except Exception as ex:
+            live_trace('envoi combat : %r' % (ex,))
         # pendant les 2 s d'attente : surveillance de la charge du FSD (un petit fichier lu 4 fois par passe, seulement en jeu)
         jdir = trouver_journal_dir() if live_etat.get('en_ligne') else None
         for _ in range(4):
             try:
                 if jdir and live_surveiller_fsd(jdir):
                     live_envoyer()
+                if jdir:
+                    cmb_envoyer()         # le combat se met a jour des que Status.json ou le journal a bouge (au plus toutes les 4 s)
             except Exception as ex:
                 live_trace('surveillance FSD : %r' % (ex,))
             time.sleep(0.5)
@@ -3438,14 +3915,15 @@ def journal_entry(cmdr, is_beta, system, station, entry, state):
 
     # Suivi CZ
     if not hasattr(journal_entry, 'cz_cache'):
-        journal_entry.cz_cache = {'intensity': 'S', 'points': 1, 'faction': '', 'won': False}
+        journal_entry.cz_cache = {'intensity': 'S', 'points': 1, 'faction': '', 'won': False, 'drop': False}
 
     if event in ['SupercruiseEntry', 'FSDJump', 'CarrierJump', 'Location']:
-        journal_entry.cz_cache = {'intensity': 'S', 'points': 1, 'faction': '', 'won': False}
+        journal_entry.cz_cache = {'intensity': 'S', 'points': 1, 'faction': '', 'won': False, 'drop': False}
 
     elif event == 'SupercruiseDestinationDrop':
         drop_type = str(entry.get('Type', '')).lower()
         if 'warzone' in drop_type or 'conflict' in drop_type:
+            journal_entry.cz_cache['drop'] = True       # l'intensite vient bien du jeu (sinon « faible » par defaut, par exemple au sol)
             journal_entry.cz_cache['won'] = False
             if 'high' in drop_type:
                 journal_entry.cz_cache['intensity'] = 'H'
@@ -3494,11 +3972,13 @@ def journal_entry(cmdr, is_beta, system, station, entry, state):
                     threading.Thread(target=maj_generique_global, args=("QG_SQUADRON_FACTION", "QG_DATA", payload_esc, "INFO")).start()
 
             conflits = entry.get('Conflicts', [])
+            try:
+                cmb_g['conf'] = {'sys': entry.get('StarSystem') or systeme_actuel, 'paires': [[(c.get('Faction1') or {}).get('Name', ''), (c.get('Faction2') or {}).get('Name', '')] for c in conflits if str(c.get('Status', '')).lower() != 'pending' and (c.get('Faction1') or {}).get('Name') and (c.get('Faction2') or {}).get('Name')]}
+            except Exception:
+                pass
             sys_nom = entry.get('StarSystem') or systeme_actuel
             if conflits and sys_nom:
                 threading.Thread(target=sync_conflits_supabase, args=(sys_nom, conflits), daemon=True).start()
-
-        threading.Thread(target=maj_generique_global, args=("TARGETED_CMDR", "SYS_CORE", "LOST", "INFO")).start()
 
     elif event == 'LoadGame':
         ship_name = entry.get('ShipName', 'VAISSEAU TACTIQUE')
@@ -3562,36 +4042,7 @@ def journal_entry(cmdr, is_beta, system, station, entry, state):
             mettre_a_jour_interface(">_ STATUT : INDÉPENDANT", "#00F0FF")
         threading.Thread(target=obtenir_infos_pilote, args=(True,)).start()
 
-    # CIBLAGE TACTIQUE
-    elif event == 'ShipTargeted':
-        global dernier_etat_cible
-        target_locked = entry.get('TargetLocked', False)
-        
-        if target_locked:
-            pilot_name_loc = entry.get('PilotName_Localised', '')
-            pilot_name = entry.get('PilotName', '')
-            nom_joueur = ""
-            if pilot_name_loc.upper().startswith("CMDR "):
-                nom_joueur = pilot_name_loc[5:].strip().upper()
-            elif "$cmdr_decorate" in pilot_name.lower():
-                nom_joueur = pilot_name.split('=')[-1].replace(';', '').strip().upper()
-                
-            if nom_joueur:
-                squad_tag = entry.get('SquadronID', '')
-                payload = json.dumps({"nom": nom_joueur, "tag": squad_tag})
-                if payload != dernier_etat_cible:
-                    dernier_etat_cible = payload
-                    threading.Thread(target=maj_generique_global, args=("TARGETED_CMDR", "SYS_CORE", payload, "INFO")).start()
-                    affichage_tag = f" [{squad_tag}]" if squad_tag else ""
-                    mettre_a_jour_interface(f">_ CIBLE : CMDR {nom_joueur}{affichage_tag}", "#FF3333")
-            else:
-                if dernier_etat_cible != "LOST":
-                    dernier_etat_cible = "LOST"
-                    threading.Thread(target=maj_generique_global, args=("TARGETED_CMDR", "SYS_CORE", "LOST", "INFO")).start()
-        else:
-            if dernier_etat_cible != "LOST":
-                dernier_etat_cible = "LOST"
-                threading.Thread(target=maj_generique_global, args=("TARGETED_CMDR", "SYS_CORE", "LOST", "INFO")).start()
+    # (le ciblage d'un joueur n'est plus envoye au site : l'alerte COVAS et le registre tactique ont ete retires ; le combat lit ShipTargeted dans cmb_traiter)
 
     if entry.get('Notoriety') is not None:
         threading.Thread(target=maj_generique_global, args=("QG_NOTORIETE", "QG_DATA", "NOTORIETE", "INFO", entry.get('Notoriety'))).start()
@@ -3861,6 +4312,7 @@ def journal_entry(cmdr, is_beta, system, station, entry, state):
 
                             # Brèves QG narratives (seuils sélectifs)
                             if action['type'] == 'CZ_VICTOIRES':
+                                cmb_victoire(action.get('intensite', 'S'), journal_entry.cz_cache.get('drop', False), ordre_valide)     # onglet Combat
                                 threading.Thread(target=notifier_journal_activite, args=("COMBAT", f"Victoire en zone de conflit ({action.get('intensite', 'S')}) à {systeme_actuel}", "#FF3333")).start()
                             elif action['type'] == 'MISSIONS' and valeur_finale >= 3:
                                 threading.Thread(target=notifier_journal_activite, args=("SOUTIEN", f"Mission navale validée (+{int(valeur_finale)} INF) pour la flotte", "#00FF66")).start()
