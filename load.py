@@ -22,7 +22,7 @@ except ImportError:
     config = None
 
 plugin_name = "SYS.EDTEAM"
-PLUGIN_VERSION = "2.39"
+PLUGIN_VERSION = "2.40"
 
 SUPABASE_URL = "https://oailvdigfdoyfcydmabb.supabase.co"
 SUPABASE_KEY = "sb_publishable_AASqgRggHdIGttZHPGaWkA_VqrhuYNg"
@@ -3114,6 +3114,62 @@ cmb_g = {'pend_p': 0, 'pend_b': 0, 'cible': None, 'bo': True, 'co': None, 'arm':
          'sale': False, 'dernier_envoi': 0.0, 'echecs': 0, 'absente': False, 'empreinte': '', 'fin_a_envoyer': False}
 
 
+# JOUEURS CROISES (historique partage de l'escadron, SQL 105) : chaque JOUEUR verrouille (pas un PNJ) est note, puis envoye par petits lots (une fois par minute au plus).
+# Le serveur ne garde qu'une fiche par joueur et ignore les membres de l'escadron ; la relecture des vieux journaux au demarrage n'ajoute rien (seuls les verrouillages recents comptent).
+CROISES_DELAI = 60            # secondes entre deux envois
+CROISES_MAX = 40              # fiches par envoi (limite du serveur)
+CROISES_RECENT = 900          # un verrouillage plus vieux que 15 minutes n'est pas note (relecture du journal)
+croises_verrou = threading.Lock()
+croises_g = {'file': {}, 'dernier': 0.0, 'echecs': 0, 'absente': False}
+
+
+def croises_noter(c, nom, t):
+    cle = nom.lower()
+    f = {'n': nom, 's': c.get('s', ''), 'sl': c.get('sl', ''), 'rg': c.get('rg', ''), 'f': c.get('f', ''), 'l': c.get('l', ''), 'e': c.get('e', ''), 'pw': c.get('pw', ''),
+         'pm': c.get('pm', 0), 'sys': live_etat.get('systeme', ''), 't': int(t)}
+    with croises_verrou:
+        prec = croises_g['file'].get(cle)
+        if prec:
+            for k in ('s', 'sl', 'rg', 'f', 'l', 'e', 'pw', 'pm', 'sys'):          # ce que le ciblage precedent savait deja (scan plus complet)
+                if not f.get(k) and prec.get(k):
+                    f[k] = prec[k]
+            croises_g['file'].pop(cle, None)
+        croises_g['file'][cle] = f
+        while len(croises_g['file']) > 200:
+            croises_g['file'].pop(next(iter(croises_g['file'])))
+
+
+def croises_envoyer(force=False):
+    g = croises_g
+    if g['absente'] or not g['file'] or not live_flags['pret']:
+        return
+    maintenant = time.time()
+    if not force and maintenant - g['dernier'] < CROISES_DELAI * (1 + min(g['echecs'], 8)):
+        return
+    if not get_user_id():
+        return
+    with croises_verrou:
+        lot = list(g['file'].items())[:CROISES_MAX]
+    g['dernier'] = maintenant
+    try:
+        res = requests.post(f"{SUPABASE_URL}/rest/v1/rpc/joueurs_croises_releve", headers=get_headers(), json={'p_joueurs': [v for _, v in lot]}, timeout=10)
+        live_trace('joueurs_croises_releve : %d fiche(s) -> HTTP %s %s' % (len(lot), res.status_code, (res.text or '')[:120]))
+        if res.status_code in (200, 201, 204):
+            with croises_verrou:
+                for k, v in lot:
+                    if croises_g['file'].get(k) is v:          # une fiche remise a jour entre-temps reste dans la file
+                        croises_g['file'].pop(k, None)
+            g['echecs'] = 0
+            return
+        if res.status_code == 404:
+            g['absente'] = True                                 # fonction pas encore creee en base : on ne reessaie pas
+            return
+        raise RuntimeError('HTTP ' + str(res.status_code))
+    except Exception as ex:
+        live_trace('joueurs croises : envoi en echec %r' % (ex,))
+        g['echecs'] += 1
+
+
 def cmb_nom(s):
     s = live_texte(s)
     m = re.search(r'#name=([^;]*);', s)
@@ -3241,6 +3297,8 @@ def cmb_traiter(e):
             if ss:
                 c['ss'] = ss
             g['cible'] = c
+            if joueur and nom and time.time() - t < CROISES_RECENT:
+                croises_noter(c, nom, t)
             if nom and c['st'] >= 2:
                 dr = cmb_g.setdefault('dern', [])         # derniers vaisseaux scannes (pour rattacher un bon de guerre a un vaisseau : le bon ne donne que la faction)
                 if not any(d['s'] == c['s'] and d['p'] == nom and d['f'] == c['f'] and not d['u'] for d in dr) or c['f']:
@@ -3648,6 +3706,10 @@ def live_boucle():
             cmb_envoyer()
         except Exception as ex:
             live_trace('envoi combat : %r' % (ex,))
+        try:
+            croises_envoyer()
+        except Exception as ex:
+            live_trace('envoi joueurs croises : %r' % (ex,))
         # pendant les 2 s d'attente : surveillance de la charge du FSD (un petit fichier lu 4 fois par passe, seulement en jeu)
         jdir = trouver_journal_dir() if live_etat.get('en_ligne') else None
         for _ in range(4):
@@ -3748,6 +3810,8 @@ def plugin_stop():
     try: bud_envoyer(force=True)
     except: pass
     try: bud_sauver_etat()
+    except: pass
+    try: croises_envoyer(force=True)
     except: pass
     try:
         with live_verrou:
