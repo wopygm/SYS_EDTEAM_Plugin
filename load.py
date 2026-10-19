@@ -22,7 +22,7 @@ except ImportError:
     config = None
 
 plugin_name = "SYS.EDTEAM"
-PLUGIN_VERSION = "2.38"
+PLUGIN_VERSION = "2.39"
 
 SUPABASE_URL = "https://oailvdigfdoyfcydmabb.supabase.co"
 SUPABASE_KEY = "sb_publishable_AASqgRggHdIGttZHPGaWkA_VqrhuYNg"
@@ -3248,8 +3248,8 @@ def cmb_traiter(e):
                     dr.append({'s': c['s'], 'p': nom, 'rg': c['rg'], 'f': c['f'], 't': int(t), 'u': False})
                     del dr[:-10]
                 cle_v = c['s'] + '|' + nom          # un vaisseau + un pilote (les PNJ d'une meme flotte portent tous le meme nom)
-                g['vus'].pop(cle_v, None)           # remis a la fin : le plus recent
-                g['vus'][cle_v] = {'s': c['s'], 'sl': c['sl'], 'p': nom, 'rg': c['rg'], 'j': c['j'], 'f': c['f'], 'l': c['l'], 'pw': c['pw'], 'po': c['po'], 't': int(t)}
+                prec = g['vus'].pop(cle_v, None) or {}      # remis a la fin : le plus recent (escadron et prime gardes si ce ciblage ne les redonne pas)
+                g['vus'][cle_v] = {'s': c['s'], 'sl': c['sl'], 'p': nom, 'rg': c['rg'], 'j': c['j'], 'f': c['f'], 'l': c['l'], 'pw': c['pw'], 'po': c['po'], 'e': c['e'] or prec.get('e', ''), 'pm': c.get('pm') or prec.get('pm', 0), 't': int(t)}
                 if len(g['vus']) > CMB_VUS_MAX:
                     g['vus'].pop(next(iter(g['vus'])))
             if not cmb_actif():       # toute cible verrouillee (supercruise comprise, armes rentrees) ouvre la vue ; la page ne bascule d'onglet que pour un vrai combat (champ cb)
