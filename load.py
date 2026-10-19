@@ -22,7 +22,7 @@ except ImportError:
     config = None
 
 plugin_name = "SYS.EDTEAM"
-PLUGIN_VERSION = "2.40"
+PLUGIN_VERSION = "2.41"
 
 SUPABASE_URL = "https://oailvdigfdoyfcydmabb.supabase.co"
 SUPABASE_KEY = "sb_publishable_AASqgRggHdIGttZHPGaWkA_VqrhuYNg"
@@ -3170,6 +3170,249 @@ def croises_envoyer(force=False):
         g['echecs'] += 1
 
 
+# HANGAR (SQL 106) : la liste des vaisseaux du pilote et l'equipement actuel de chacun, pour la fenetre « Hangar » (fiche pilote) et la page « Mon hangar ».
+# Sources du journal : Loadout (equipement complet du vaisseau pilote, a chaque changement), StoredShips (liste des vaisseaux ranges, a l'ouverture du chantier naval),
+# ShipyardNew (achat), ShipyardSell / SellShipOnRebuy (vente). Aucune valeur en credits ni position n'est envoyee. Rien n'est envoye tant que rien n'a change ;
+# l'envoi est groupe (une fois par minute au plus), le serveur remplace la ligne du pilote. Les modifications d'ingenierie (valeurs) ne sont pas gardees : niveau, plan, effet, ingenieur.
+HG_FICHIER = 'hangar_etat.json'
+HG_RELECTURE = '2.41'            # a changer pour obliger tous les plugins a relire une fois tous leurs journaux
+HG_DELAI = 60                    # secondes entre deux envois
+HG_MAX_VAISSEAUX = 60
+HG_MAX_MODULES = 90
+HG_MAX_OCTETS = 230000           # le serveur refuse au-dela de 250 000
+HG_IGNORE = re.compile(r'^(Decal|ShipName|ShipID|PaintJob|VesselVoice|Bobble|Nameplate|WeaponColour|EngineColour|ShipKit|ShipCockpit|CargoHatch|Hologram)')
+hg_re_journal = re.compile('"event":"(Loadout|StoredShips|ShipyardNew|ShipyardSell|SellShipOnRebuy)"')
+hg_verrou = threading.RLock()
+hg_etat = {'ships': {}, 'courant': '', 'marqueur': ''}      # ships : {id (texte) : {'t': type, 'n': nom, 'm': [modules] ou absent, 'ts': horodatage}}
+hg_flags = {'pret': False, 'sale': False, 'absente': False, 'dernier': 0.0, 'echecs': 0, 'empreinte': '', 'sauve': 0.0}
+hg_file = []                     # evenements vus en direct pendant la relecture des journaux
+
+
+def hg_chemin():
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), HG_FICHIER)
+
+
+def hg_trace(msg):
+    """Diagnostic : n'ecrit QUE si un fichier hangar_debug.txt existe deja a cote de load.py (le creer vide pour activer)."""
+    try:
+        chemin = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'hangar_debug.txt')
+        if not os.path.exists(chemin):
+            return
+        with open(chemin, 'a', encoding='utf-8') as f:
+            f.write(datetime.now().strftime('%H:%M:%S') + ' ' + str(msg) + chr(10))
+    except Exception:
+        pass
+
+
+def hg_charger_etat():
+    try:
+        with open(hg_chemin(), 'r', encoding='utf-8') as f:
+            d = json.load(f)
+        with hg_verrou:
+            hg_etat['ships'] = dict(d.get('ships') or {})
+            hg_etat['courant'] = str(d.get('courant') or '')
+            hg_etat['marqueur'] = str(d.get('marqueur') or '')
+    except Exception:
+        pass
+
+
+def hg_sauver_etat():
+    """Ecriture atomique de l'etat (a cote de load.py) : evite de relire tous les journaux a chaque demarrage."""
+    try:
+        with hg_verrou:
+            donnees = json.dumps(hg_etat)
+            hg_flags['sauve'] = time.time()
+        tmp = hg_chemin() + '.tmp'
+        with open(tmp, 'w', encoding='utf-8') as f:
+            f.write(donnees)
+        os.replace(tmp, hg_chemin())
+    except Exception as e:
+        hg_trace('sauvegarde impossible : %r' % (e,))
+
+
+def hg_modules(mods):
+    """Modules d'un Loadout, sous forme compacte : emplacement, objet, allume, niveau d'ingenierie, plan, effet experimental, ingenieur."""
+    res = []
+    try:
+        for mod in (mods or []):
+            slot = str(mod.get('Slot') or '')
+            if not slot or HG_IGNORE.match(slot):
+                continue
+            o = {'s': slot[:40], 'i': str(mod.get('Item') or '').lower()[:90], 'o': 1 if mod.get('On', True) else 0}
+            g = mod.get('Engineering')
+            if isinstance(g, dict):
+                o['g'] = int(g.get('Level') or 0)
+                o['b'] = str(g.get('BlueprintName') or '')[:60]
+                o['x'] = str(g.get('ExperimentalEffect') or '')[:60]
+                o['e'] = live_texte(g.get('Engineer'))[:40]
+            res.append(o)
+    except Exception:
+        pass
+    return res[:HG_MAX_MODULES]
+
+
+def hg_appliquer(e):
+    """Un evenement du journal (sous hg_verrou). Idempotent : le meme evenement vu deux fois donne le meme etat."""
+    ev = e.get('event')
+    ships = hg_etat['ships']
+    ts = str(e.get('timestamp') or '')
+    if ev == 'Loadout':
+        sid = str(e.get('ShipID', ''))
+        if not sid:
+            return
+        s = ships.setdefault(sid, {})
+        s['t'] = str(e.get('Ship') or s.get('t') or '').lower()[:40]
+        s['n'] = live_texte(e.get('ShipName') or '')[:60]
+        s['m'] = hg_modules(e.get('Modules'))
+        s['ts'] = ts
+        hg_etat['courant'] = sid
+    elif ev == 'StoredShips':
+        ids = set()
+        for lst in ('ShipsHere', 'ShipsRemote'):
+            for x in (e.get(lst) or []):
+                try:
+                    sid = str(x.get('ShipID', ''))
+                except Exception:
+                    continue
+                if not sid:
+                    continue
+                ids.add(sid)
+                s = ships.setdefault(sid, {})
+                s['t'] = str(x.get('ShipType') or s.get('t') or '').lower()[:40]
+                if x.get('Name'):
+                    s['n'] = live_texte(x.get('Name'))[:60]
+        # la liste des vaisseaux ranges fait foi : un vaisseau qui n'y est pas (et n'est pas celui que l'on pilote) n'existe plus
+        for sid in list(ships.keys()):
+            if sid not in ids and sid != hg_etat['courant']:
+                ships.pop(sid, None)
+    elif ev == 'ShipyardNew':
+        sid = str(e.get('NewShipID', ''))
+        if sid and sid not in ships:
+            ships[sid] = {'t': str(e.get('ShipType') or '').lower()[:40], 'n': '', 'ts': ts}
+    elif ev in ('ShipyardSell', 'SellShipOnRebuy'):
+        ships.pop(str(e.get('SellShipID', '')), None)
+    else:
+        return
+    hg_flags['sale'] = True
+
+
+def hg_traiter_evenement(e):
+    """Appelee pour chaque evenement en direct (aucun appel reseau). Pendant la relecture des journaux, les evenements attendent dans hg_file."""
+    if e.get('event') not in ('Loadout', 'StoredShips', 'ShipyardNew', 'ShipyardSell', 'SellShipOnRebuy'):
+        return
+    with hg_verrou:
+        if not hg_flags['pret']:
+            hg_file.append(e)
+            return
+        hg_appliquer(e)
+
+
+def hg_scanner_journaux():
+    """Au demarrage : relit TOUS les journaux la premiere fois (ou quand HG_RELECTURE change), ensuite seulement ceux des 2 derniers jours.
+    Seul le dernier Loadout de chaque vaisseau compte, donc l'ordre chronologique suffit."""
+    try:
+        hg_charger_etat()
+        complet = hg_etat.get('marqueur') != HG_RELECTURE
+        jdir = trouver_journal_dir()
+        if jdir and os.path.isdir(jdir):
+            limite = None if complet else time.time() - 2 * 86400
+            fichiers = sorted(f for f in os.listdir(jdir)
+                              if f.startswith('Journal.') and f.endswith('.log')
+                              and (limite is None or os.path.getmtime(os.path.join(jdir, f)) >= limite))
+            nb = 0
+            for nom_fichier in fichiers:
+                with open(os.path.join(jdir, nom_fichier), 'r', encoding='utf-8', errors='ignore') as f:
+                    for ligne in f:
+                        if not hg_re_journal.search(ligne):
+                            continue
+                        try:
+                            e = json.loads(ligne)
+                        except Exception:
+                            continue
+                        with hg_verrou:
+                            hg_appliquer(e)
+                        nb += 1
+            with hg_verrou:
+                hg_etat['marqueur'] = HG_RELECTURE
+            hg_trace('relecture %s : %d fichiers, %d evenements utiles, %d vaisseaux' % ('complete' if complet else 'recente', len(fichiers), nb, len(hg_etat['ships'])))
+    except Exception as ex:
+        hg_trace('relecture : EXCEPTION %r' % (ex,))
+    finally:
+        with hg_verrou:
+            en_attente = list(hg_file)
+            del hg_file[:]
+            for e in en_attente:
+                try:
+                    hg_appliquer(e)
+                except Exception:
+                    pass
+            hg_flags['pret'] = True
+            hg_flags['sale'] = True
+
+
+def hg_instantane():
+    """Liste a envoyer : [{'i': id, 't': type, 'n': nom, 'm': [modules] (absent si equipement inconnu), 'c': 1 pour le vaisseau pilote}], au plus HG_MAX_VAISSEAUX."""
+    with hg_verrou:
+        items = []
+        for sid, s in hg_etat['ships'].items():
+            try:
+                i = int(sid)
+            except Exception:
+                continue
+            if not s.get('t'):
+                continue
+            o = {'i': i, 't': s.get('t', ''), 'n': s.get('n', '')}
+            if isinstance(s.get('m'), list):
+                o['m'] = s['m']
+            if sid == hg_etat['courant']:
+                o['c'] = 1
+            items.append((s.get('ts', ''), o))
+    items.sort(key=lambda x: x[0], reverse=True)
+    liste = [o for _, o in items][:HG_MAX_VAISSEAUX]
+    liste.sort(key=lambda o: o['i'])
+    # garde-fou de taille : au besoin, on retire l'equipement des vaisseaux les plus anciens
+    anciens = [o for _, o in reversed(items) if 'm' in o]
+    while len(json.dumps(liste)) > HG_MAX_OCTETS and anciens:
+        anciens.pop(0).pop('m', None)
+    return liste
+
+
+def hg_envoyer(force=False):
+    g = hg_flags
+    if g['absente'] or not g['pret'] or not g['sale'] or not live_flags['pret']:
+        return
+    maintenant = time.time()
+    if not force and maintenant - g['dernier'] < HG_DELAI * (1 + min(g['echecs'], 8)):
+        return
+    if not get_user_id():
+        return
+    liste = hg_instantane()
+    if not liste:
+        g['sale'] = False
+        return
+    empreinte = hashlib.md5(json.dumps(liste, sort_keys=True).encode('utf-8')).hexdigest()
+    if empreinte == g['empreinte']:
+        g['sale'] = False
+        return
+    g['dernier'] = maintenant
+    try:
+        res = requests.post(f"{SUPABASE_URL}/rest/v1/rpc/hangar_releve", headers=get_headers(), json={'p_vaisseaux': liste}, timeout=15)
+        hg_trace('hangar_releve : %d vaisseau(x) -> HTTP %s %s' % (len(liste), res.status_code, (res.text or '')[:120]))
+        if res.status_code in (200, 201, 204):
+            g['empreinte'] = empreinte
+            g['sale'] = False
+            g['echecs'] = 0
+            hg_sauver_etat()
+            return
+        if res.status_code == 404:
+            g['absente'] = True                                 # fonction pas encore creee en base : on ne reessaie pas
+            return
+        raise RuntimeError('HTTP ' + str(res.status_code))
+    except Exception as ex:
+        hg_trace('envoi en echec %r' % (ex,))
+        g['echecs'] += 1
+
+
 def cmb_nom(s):
     s = live_texte(s)
     m = re.search(r'#name=([^;]*);', s)
@@ -3710,6 +3953,10 @@ def live_boucle():
             croises_envoyer()
         except Exception as ex:
             live_trace('envoi joueurs croises : %r' % (ex,))
+        try:
+            hg_envoyer()
+        except Exception as ex:
+            live_trace('envoi hangar : %r' % (ex,))
         # pendant les 2 s d'attente : surveillance de la charge du FSD (un petit fichier lu 4 fois par passe, seulement en jeu)
         jdir = trouver_journal_dir() if live_etat.get('en_ligne') else None
         for _ in range(4):
@@ -3792,6 +4039,7 @@ def plugin_start3(plugin_dir):
     threading.Thread(target=col_scanner_journaux, daemon=True).start()
     threading.Thread(target=ppm_scanner_journaux, daemon=True).start()
     threading.Thread(target=bud_scanner_journaux, daemon=True).start()
+    threading.Thread(target=hg_scanner_journaux, daemon=True).start()
     threading.Thread(target=live_boucle, daemon=True).start()
     return "SYS.EDTEAM"
 
@@ -3812,6 +4060,10 @@ def plugin_stop():
     try: bud_sauver_etat()
     except: pass
     try: croises_envoyer(force=True)
+    except: pass
+    try: hg_envoyer(force=True)
+    except: pass
+    try: hg_sauver_etat()
     except: pass
     try:
         with live_verrou:
@@ -3976,6 +4228,10 @@ def journal_entry(cmdr, is_beta, system, station, entry, state):
     # Budget : revenus et charges (aucun appel reseau ici)
     try: bud_traiter_evenement(entry)
     except Exception as e: bud_trace('evenement ignore : %r' % (e,))
+
+    # Hangar : vaisseaux et equipement de chacun (aucun appel reseau ici)
+    try: hg_traiter_evenement(entry)
+    except Exception as e: hg_trace('evenement ignore : %r' % (e,))
 
     # Suivi CZ
     if not hasattr(journal_entry, 'cz_cache'):
