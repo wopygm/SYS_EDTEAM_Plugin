@@ -22,7 +22,7 @@ except ImportError:
     config = None
 
 plugin_name = "SYS.EDTEAM"
-PLUGIN_VERSION = "2.41"
+PLUGIN_VERSION = "2.42"
 
 SUPABASE_URL = "https://oailvdigfdoyfcydmabb.supabase.co"
 SUPABASE_KEY = "sb_publishable_AASqgRggHdIGttZHPGaWkA_VqrhuYNg"
@@ -4090,6 +4090,81 @@ def plugin_prefs(parent, cmdr, is_beta):
     cle_api_var.trace_add("write", lambda *args: sauvegarder_cle(cle_api_var.get()))
     return frame
 
+# =====================================================================================================
+# RELEVE DU SYSTEME POUR LES DIRECTIVES (v2.42) : EDSM n'est mis a jour que si un joueur visite le systeme avec un outil qui envoie ses donnees.
+# Quand le pilote ARRIVE (saut ou localisation) dans un systeme cible d'une directive ACTIVE de son escadron, la liste des factions du journal (influence, etats) est envoyee a la fonction serveur
+# bgs_releve_pilote. La page affiche alors « mis a jour par CMDR X il y a N h ». Rien n'est envoye pour les autres systemes ; une fonction serveur absente (404) arrete les essais jusqu'au redemarrage.
+# =====================================================================================================
+bgs_releve_etat = {'absente': False, 'derniers': {}, 'ordres': [], 'ordres_ts': 0.0}
+
+def bgs_ordres_cibles():
+    """Systemes des directives actives (liste mise en memoire 5 minutes). Vide si la lecture echoue."""
+    try:
+        maintenant = time.time()
+        if maintenant - bgs_releve_etat['ordres_ts'] > 300:
+            res = requests.get(f"{SUPABASE_URL}/rest/v1/ordres_bgs?statut=eq.ACTIF&select=systeme_cible", headers=get_headers(), timeout=5)
+            if res.status_code == 200:
+                bgs_releve_etat['ordres'] = [str(o.get('systeme_cible') or '').strip().lower() for o in res.json() if o.get('systeme_cible')]
+                bgs_releve_etat['ordres_ts'] = maintenant
+        return bgs_releve_etat['ordres']
+    except Exception:
+        return bgs_releve_etat['ordres']
+
+def bgs_noms_etats(liste):
+    """['Expansion', 'War'] a partir de [{'State': 'Expansion'}, ...] (journal du jeu)."""
+    out = []
+    for e in (liste or []):
+        n = e.get('State') if isinstance(e, dict) else None
+        if n: out.append(str(n))
+    return out[:8]
+
+def bgs_releve_charge(entry):
+    """Construit la charge utile d'un releve a partir d'un FSDJump / Location : None si rien a envoyer."""
+    systeme = str(entry.get('StarSystem') or '').strip()
+    factions = entry.get('Factions') or []
+    if not systeme or not isinstance(factions, list) or not factions: return None
+    liste = []
+    for f in factions[:14]:
+        if not isinstance(f, dict): continue
+        nom, inf = f.get('Name'), f.get('Influence')
+        if not nom or inf is None: continue
+        try: inf = float(inf)
+        except Exception: continue
+        if inf < 0 or inf > 1: continue
+        liste.append({'n': str(nom), 'i': round(inf, 6), 'e': str(f.get('FactionState') or ''), 'a': bgs_noms_etats(f.get('ActiveStates')),
+                      'p': bgs_noms_etats(f.get('PendingStates')), 'r': bgs_noms_etats(f.get('RecoveringStates')), 'h': str(f.get('Happiness_Localised') or '')})
+    if not liste: return None
+    return {'p_systeme': systeme, 'p_ts': str(entry.get('timestamp') or ''), 'p_factions': liste}
+
+def bgs_releve_systeme(entry):
+    try:
+        if bgs_releve_etat['absente']: return
+        charge = bgs_releve_charge(entry)
+        if not charge or not charge['p_ts']: return
+        cle = charge['p_systeme'].strip().lower()
+        if bgs_releve_etat['derniers'].get(cle) == charge['p_ts']: return
+        if not get_user_id(): return
+        if cle not in bgs_ordres_cibles(): return
+        res = requests.post(f"{SUPABASE_URL}/rest/v1/rpc/bgs_releve_pilote", headers=get_headers(), json=charge, timeout=8)
+        nom = charge['p_systeme'].upper()
+        if res.status_code == 404:
+            bgs_releve_etat['absente'] = True
+            mettre_a_jour_interface(">_ BGS : RELEVÉ DU SYSTÈME INDISPONIBLE (fonction serveur absente)", "#FF9A1F")
+        elif res.status_code in (200, 201, 204):
+            bgs_releve_etat['derniers'][cle] = charge['p_ts']
+            try: rep = res.json() if res.content else {}
+            except Exception: rep = {}
+            if not isinstance(rep, dict): rep = {}
+            if rep.get('ok'):
+                if rep.get('ignore'): mettre_a_jour_interface(f">_ BGS : {nom} DÉJÀ À JOUR (relevé plus récent connu)", "#00FF66")
+                else: mettre_a_jour_interface(f">_ BGS : RELEVÉ DU SYSTÈME ({nom}) ENVOYÉ", "#00FF66")
+            else:
+                mettre_a_jour_interface(f">_ BGS : RELEVÉ DE {nom} REFUSÉ ({rep.get('raison') or 'réponse vide'})", "#FF9A1F")
+        else:
+            mettre_a_jour_interface(f">_ BGS : RELEVÉ DE {nom} ÉCHOUÉ (HTTP {res.status_code})", "#FF9A1F")
+    except Exception as e:
+        logging.error(f"[SYS_EDTEAM] Erreur releve du systeme : {e}")
+
 def sync_conflits_supabase(systeme, conflits):
     try:
         h = get_headers()
@@ -4299,6 +4374,8 @@ def journal_entry(cmdr, is_beta, system, station, entry, state):
             sys_nom = entry.get('StarSystem') or systeme_actuel
             if conflits and sys_nom:
                 threading.Thread(target=sync_conflits_supabase, args=(sys_nom, conflits), daemon=True).start()
+            # releve des factions du systeme, seulement s'il est cible d'une directive active (v2.42)
+            threading.Thread(target=bgs_releve_systeme, args=(entry,), daemon=True).start()
 
     elif event == 'LoadGame':
         ship_name = entry.get('ShipName', 'VAISSEAU TACTIQUE')
