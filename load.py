@@ -22,7 +22,7 @@ except ImportError:
     config = None
 
 plugin_name = "SYS.EDTEAM"
-PLUGIN_VERSION = "2.42"
+PLUGIN_VERSION = "2.43"
 
 SUPABASE_URL = "https://oailvdigfdoyfcydmabb.supabase.co"
 SUPABASE_KEY = "sb_publishable_AASqgRggHdIGttZHPGaWkA_VqrhuYNg"
@@ -3126,13 +3126,14 @@ croises_g = {'file': {}, 'dernier': 0.0, 'echecs': 0, 'absente': False}
 def croises_noter(c, nom, t):
     cle = nom.lower()
     f = {'n': nom, 's': c.get('s', ''), 'sl': c.get('sl', ''), 'rg': c.get('rg', ''), 'f': c.get('f', ''), 'l': c.get('l', ''), 'e': c.get('e', ''), 'pw': c.get('pw', ''),
-         'pm': c.get('pm', 0), 'sys': live_etat.get('systeme', ''), 't': int(t)}
+         'pm': c.get('pm', 0), 'sys': live_etat.get('systeme', ''), 't': int(t), 'st': int(c.get('st') or 0)}      # st = stade du scan (le serveur ne compte pour L'ESPION que le stade 2 ou plus)
     with croises_verrou:
         prec = croises_g['file'].get(cle)
         if prec:
             for k in ('s', 'sl', 'rg', 'f', 'l', 'e', 'pw', 'pm', 'sys'):          # ce que le ciblage precedent savait deja (scan plus complet)
                 if not f.get(k) and prec.get(k):
                     f[k] = prec[k]
+            f['st'] = max(int(f.get('st') or 0), int(prec.get('st') or 0))          # le scan le plus complet de la file
             croises_g['file'].pop(cle, None)
         croises_g['file'][cle] = f
         while len(croises_g['file']) > 200:
@@ -4165,6 +4166,74 @@ def bgs_releve_systeme(entry):
     except Exception as e:
         logging.error(f"[SYS_EDTEAM] Erreur releve du systeme : {e}")
 
+# =====================================================================================================
+# MISSION DE REPERAGE (v2.43) : l'escadron liste les systemes dont la donnee est trop vieille (directives, expansions rivales, places libres, conquetes Powerplay).
+# Quand le pilote ARRIVE dans l'un d'eux (saut ou localisation), le plugin envoie ce que voit son jeu : coordonnees, nombre de factions, progression de conquete des puissances.
+# Aucun envoi pour les autres systemes. La liste des noms vient de la fonction serveur reperage_cibles (gardee 20 minutes).
+# =====================================================================================================
+reperage_etat = {'absente': False, 'cibles': set(), 'cibles_ts': 0.0, 'derniers': {}}
+
+def reperage_cibles_liste():
+    try:
+        maintenant = time.time()
+        if maintenant - reperage_etat['cibles_ts'] > 1200:
+            res = requests.post(f"{SUPABASE_URL}/rest/v1/rpc/reperage_cibles", headers=get_headers(), json={}, timeout=6)
+            if res.status_code == 404:
+                reperage_etat['absente'] = True
+                return set()
+            if res.status_code == 200:
+                reperage_etat['cibles'] = {str(x).strip().upper() for x in (res.json() or []) if x}
+                reperage_etat['cibles_ts'] = maintenant
+        return reperage_etat['cibles']
+    except Exception:
+        return reperage_etat['cibles']
+
+def reperage_charge(entry):
+    """Charge utile d'un releve (FSDJump / Location) : None si le systeme n'a pas de nom."""
+    systeme = str(entry.get('StarSystem') or '').strip()
+    if not systeme: return None
+    charge = {'s': systeme, 'ts': str(entry.get('timestamp') or '')}
+    pos = entry.get('StarPos')
+    if isinstance(pos, list) and len(pos) == 3:
+        try: charge['x'], charge['y'], charge['z'] = float(pos[0]), float(pos[1]), float(pos[2])
+        except Exception: pass
+    factions = entry.get('Factions')
+    if isinstance(factions, list): charge['nb'] = len(factions)
+    pp = []
+    for c in (entry.get('PowerplayConflictProgress') or [])[:14]:
+        try:
+            if isinstance(c, dict) and c.get('Power') and c.get('ConflictProgress') is not None:
+                v = float(c.get('ConflictProgress'))
+                if 0 <= v <= 1: pp.append({'p': str(c.get('Power')), 'v': round(v, 6)})
+        except Exception:
+            pass
+    if pp: charge['pp'] = pp
+    return charge
+
+def reperage_releve_systeme(entry):
+    try:
+        if reperage_etat['absente']: return
+        charge = reperage_charge(entry)
+        if not charge or not charge['ts']: return
+        cle = charge['s'].upper()
+        if reperage_etat['derniers'].get(cle) == charge['ts']: return
+        if not get_user_id(): return
+        if cle not in reperage_cibles_liste(): return
+        res = requests.post(f"{SUPABASE_URL}/rest/v1/rpc/reperage_releve", headers=get_headers(), json={'p': charge}, timeout=8)
+        if res.status_code == 404:
+            reperage_etat['absente'] = True
+        elif res.status_code in (200, 201, 204):
+            reperage_etat['derniers'][cle] = charge['ts']
+            try: rep = res.json() if res.content else {}
+            except Exception: rep = {}
+            if not isinstance(rep, dict): rep = {}
+            if rep.get('ok'): mettre_a_jour_interface(f">_ REPÉRAGE : {cle} RELEVÉ POUR L'ESCADRON" + (" (+1 POINT BGS)" if rep.get('point') else ""), "#00F0FF")
+            else: mettre_a_jour_interface(f">_ REPÉRAGE : {cle} REFUSÉ ({rep.get('raison') or 'réponse vide'})", "#FF9A1F")
+        else:
+            mettre_a_jour_interface(f">_ REPÉRAGE : {cle} ÉCHOUÉ (HTTP {res.status_code})", "#FF9A1F")
+    except Exception as e:
+        logging.error(f"[SYS_EDTEAM] Erreur repérage : {e}")
+
 def sync_conflits_supabase(systeme, conflits):
     try:
         h = get_headers()
@@ -4376,6 +4445,8 @@ def journal_entry(cmdr, is_beta, system, station, entry, state):
                 threading.Thread(target=sync_conflits_supabase, args=(sys_nom, conflits), daemon=True).start()
             # releve des factions du systeme, seulement s'il est cible d'une directive active (v2.42)
             threading.Thread(target=bgs_releve_systeme, args=(entry,), daemon=True).start()
+            # mission de reperage de l'escadron : coordonnees, nombre de factions, progression de conquete (v2.43)
+            threading.Thread(target=reperage_releve_systeme, args=(entry,), daemon=True).start()
 
     elif event == 'LoadGame':
         ship_name = entry.get('ShipName', 'VAISSEAU TACTIQUE')
