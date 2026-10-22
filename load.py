@@ -22,7 +22,7 @@ except ImportError:
     config = None
 
 plugin_name = "SYS.EDTEAM"
-PLUGIN_VERSION = "2.43"
+PLUGIN_VERSION = "2.44"
 
 SUPABASE_URL = "https://oailvdigfdoyfcydmabb.supabase.co"
 SUPABASE_KEY = "sb_publishable_AASqgRggHdIGttZHPGaWkA_VqrhuYNg"
@@ -3140,6 +3140,37 @@ def croises_noter(c, nom, t):
             croises_g['file'].pop(next(iter(croises_g['file'])))
 
 
+# ALERTE « JOUEUR VERROUILLE » (v2.44) : quand un CMDR (un joueur, pas un PNJ) est verrouille, un tout petit signal (nom, vaisseau, rang, faction) est envoye a la base ; les pages du site
+# qui ont l'option « Alerte combat » activee affichent un gros bouton pour basculer sur l'onglet Combat. Un meme joueur n'declenche qu'un signal toutes les 45 s ; l'envoi se fait dans un fil
+# a part (le journal du jeu n'attend jamais le reseau) ; la relecture d'un vieux journal ne declenche rien (seul un verrouillage de moins de 20 s compte).
+alerte_g = {'nom': '', 't': 0.0, 'absente': False}
+
+
+def alerte_envoyer(c, nom):
+    try:
+        if alerte_g['absente'] or not get_user_id():
+            return
+        maintenant = time.time()
+        if nom.lower() == alerte_g['nom'] and maintenant - alerte_g['t'] < 45:
+            return
+        alerte_g['nom'] = nom.lower()
+        alerte_g['t'] = maintenant
+        charge = {'p': {'n': str(nom)[:64], 'sl': str(c.get('sl', ''))[:60], 'rg': str(c.get('rg', ''))[:40], 'f': str(c.get('f', ''))[:80], 'pw': str(c.get('pw', ''))[:40],
+                        'e': str(c.get('e', ''))[:12], 'st': int(c.get('st') or 0)}}
+
+        def travail():
+            try:
+                res = requests.post(f"{SUPABASE_URL}/rest/v1/rpc/alerte_cible_poser", headers=get_headers(), json=charge, timeout=5)
+                live_trace('alerte_cible_poser : %s -> HTTP %s' % (nom, res.status_code))
+                if res.status_code == 404:
+                    alerte_g['absente'] = True          # fonction pas encore creee en base : on ne reessaie pas
+            except Exception as ex:
+                live_trace('alerte joueur verrouille : echec %r' % (ex,))
+        threading.Thread(target=travail, daemon=True).start()
+    except Exception:
+        pass
+
+
 def croises_envoyer(force=False):
     g = croises_g
     if g['absente'] or not g['file'] or not live_flags['pret']:
@@ -3543,6 +3574,8 @@ def cmb_traiter(e):
             g['cible'] = c
             if joueur and nom and time.time() - t < CROISES_RECENT:
                 croises_noter(c, nom, t)
+            if joueur and nom and time.time() - t < 20:
+                alerte_envoyer(c, nom)
             if nom and c['st'] >= 2:
                 dr = cmb_g.setdefault('dern', [])         # derniers vaisseaux scannes (pour rattacher un bon de guerre a un vaisseau : le bon ne donne que la faction)
                 if not any(d['s'] == c['s'] and d['p'] == nom and d['f'] == c['f'] and not d['u'] for d in dr) or c['f']:
