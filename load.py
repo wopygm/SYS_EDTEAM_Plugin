@@ -22,7 +22,7 @@ except ImportError:
     config = None
 
 plugin_name = "SYS.EDTEAM"
-PLUGIN_VERSION = "2.45"
+PLUGIN_VERSION = "2.46"
 
 SUPABASE_URL = "https://oailvdigfdoyfcydmabb.supabase.co"
 SUPABASE_KEY = "sb_publishable_AASqgRggHdIGttZHPGaWkA_VqrhuYNg"
@@ -4711,7 +4711,7 @@ def journal_entry(cmdr, is_beta, system, station, entry, state):
                         act_sci["details"] = "Exobiologie"
                     actions.append(act_sci)
 
-            # Commerce : une vente au marché compte comme ECONOMIE (ou CONTREBANDE si volée). Elle n'est JAMAIS une livraison de colonisation :
+            # Commerce : une vente au marché compte comme ECONOMIE, pour son BÉNÉFICE seulement (ou CONTREBANDE si volée). Elle n'est JAMAIS une livraison de colonisation :
             # les vraies livraisons à un chantier (ColonisationContribution) sont relevées par le module colonisation, côté serveur.
             elif evt == 'MarketSell':
                 val = entry.get('TotalSale', 0)
@@ -4720,18 +4720,22 @@ def journal_entry(cmdr, is_beta, system, station, entry, state):
                     # Vente a perte : prix paye moyen superieur au prix de vente (marchandise achetee ; un minage ou un butin a un prix paye de 0).
                     # Sous une directive de BAISSE de la faction de la station, elle fait baisser son influence : le serveur recoit la PERTE en credits (voir la boucle d'envoi).
                     perte = 0
+                    benefice = val
                     if not illegal:
                         try:
-                            perte = int(float(entry.get('AvgPricePaid', 0) or 0) * float(entry.get('Count', 0) or 0) - float(val))
+                            benefice = int(float(val) - float(entry.get('AvgPricePaid', 0) or 0) * float(entry.get('Count', 0) or 0))
                         except (TypeError, ValueError):
-                            perte = 0
+                            benefice = val
+                        perte = -benefice if benefice < 0 else 0
                     action_vente = {
                         "faction": f_station,
                         "type": "CONTREBANDE" if illegal else "ECONOMIE",
-                        "valeur": val,
+                        "valeur": val if illegal else benefice,    # commerce : seul le BENEFICE fait monter l'influence (marchandise minee ou recuperee : prix paye 0, tout est benefice)
                         "system": systeme_actuel,
                         "is_combat": False
                     }
+                    if not illegal:
+                        action_vente["details"] = "Vente : " + str(int(val)) + " CR"    # montant de la vente, affiche a cote du benefice
                     if perte > 0:
                         action_vente["perte"] = perte
                         action_vente["details_perte"] = "Vente à perte : " + str(entry.get('Type_Localised') or entry.get('Type') or '?') + " x" + str(entry.get('Count', 0))
@@ -4807,6 +4811,9 @@ def journal_entry(cmdr, is_beta, system, station, entry, state):
                         if ordre_valide and ordre_valide.get('type_ordre') == 'BAISSE' and action['type'] == 'ECONOMIE' and action.get('perte', 0) > 0:
                             action = dict(action, type='VENTE_PERTE', valeur=action['perte'], details=action.get('details_perte'))
                             valeur_finale = action['valeur']
+
+                        # Commerce sans benefice (vente a perte hors BAISSE, ou a prix coutant) : rien a envoyer
+                        if action['type'] == 'ECONOMIE' and action['valeur'] <= 0: continue
 
                         payload = {
                             "user_id": user_id, 
