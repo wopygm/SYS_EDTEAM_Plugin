@@ -22,7 +22,7 @@ except ImportError:
     config = None
 
 plugin_name = "SYS.EDTEAM"
-PLUGIN_VERSION = "2.44"
+PLUGIN_VERSION = "2.45"
 
 SUPABASE_URL = "https://oailvdigfdoyfcydmabb.supabase.co"
 SUPABASE_KEY = "sb_publishable_AASqgRggHdIGttZHPGaWkA_VqrhuYNg"
@@ -4716,13 +4716,26 @@ def journal_entry(cmdr, is_beta, system, station, entry, state):
             elif evt == 'MarketSell':
                 val = entry.get('TotalSale', 0)
                 if val > 0:
-                    actions.append({
+                    illegal = bool(entry.get('Stolen', False) or entry.get('IllegalGoods', False))
+                    # Vente a perte : prix paye moyen superieur au prix de vente (marchandise achetee ; un minage ou un butin a un prix paye de 0).
+                    # Sous une directive de BAISSE de la faction de la station, elle fait baisser son influence : le serveur recoit la PERTE en credits (voir la boucle d'envoi).
+                    perte = 0
+                    if not illegal:
+                        try:
+                            perte = int(float(entry.get('AvgPricePaid', 0) or 0) * float(entry.get('Count', 0) or 0) - float(val))
+                        except (TypeError, ValueError):
+                            perte = 0
+                    action_vente = {
                         "faction": f_station,
-                        "type": "CONTREBANDE" if (entry.get('Stolen', False) or entry.get('IllegalGoods', False)) else "ECONOMIE",
+                        "type": "CONTREBANDE" if illegal else "ECONOMIE",
                         "valeur": val,
                         "system": systeme_actuel,
                         "is_combat": False
-                    })
+                    }
+                    if perte > 0:
+                        action_vente["perte"] = perte
+                        action_vente["details_perte"] = "Vente à perte : " + str(entry.get('Type_Localised') or entry.get('Type') or '?') + " x" + str(entry.get('Count', 0))
+                    actions.append(action_vente)
 
             elif evt == 'CommitCrime' and 'murder' in str(entry.get('CrimeType', '')).lower():
                 faction_victime = entry.get('Faction', '') or f_station
@@ -4788,6 +4801,11 @@ def journal_entry(cmdr, is_beta, system, station, entry, state):
                             else:
                                 valeur_finale = action['valeur']
                         else:
+                            valeur_finale = action['valeur']
+
+                        # Vente a perte dans une station de la faction visee par une BAISSE : action offensive (VENTE_PERTE), valeur = perte en credits
+                        if ordre_valide and ordre_valide.get('type_ordre') == 'BAISSE' and action['type'] == 'ECONOMIE' and action.get('perte', 0) > 0:
+                            action = dict(action, type='VENTE_PERTE', valeur=action['perte'], details=action.get('details_perte'))
                             valeur_finale = action['valeur']
 
                         payload = {
