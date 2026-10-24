@@ -22,7 +22,7 @@ except ImportError:
     config = None
 
 plugin_name = "SYS.EDTEAM"
-PLUGIN_VERSION = "2.46"
+PLUGIN_VERSION = "2.47"
 
 SUPABASE_URL = "https://oailvdigfdoyfcydmabb.supabase.co"
 SUPABASE_KEY = "sb_publishable_AASqgRggHdIGttZHPGaWkA_VqrhuYNg"
@@ -3593,11 +3593,19 @@ def cmb_traiter(e):
                 cmb['s']['pvp'] = t         # dernier signe de PvP (horodatage) : le mode PvP ne dure que quelques minutes apres
         cmb_marquer()
     elif ev == 'CommitCrime':
-        if str(e.get('CrimeType') or '').lower() in ('assault', 'murder'):         # agression contre un vaisseau : la cible devient hostile pour nous
+        crime = str(e.get('CrimeType') or '').lower()
+        if crime in ('assault', 'murder'):         # agression contre un vaisseau : la cible devient hostile pour nous
             ag = g.setdefault('agr', [])
             ag.append([cmb_nom(e.get('Victim')), live_texte(e.get('Faction')), int(t)])
             del ag[:-8]
             cmb_marquer()
+        if crime in ('murder', 'onfoot_murder') and e.get('Victim'):         # meurtre d'un innocent (a pied ou en vaisseau) : le jeu n'ecrit ni Bounty ni bon de guerre, donc aucun kill sans cette ligne
+            s = cmb_session(t, ts)
+            if not s['mode']:
+                s['mode'] = 'secu'
+            nom = cmb_nom(e.get('Victim_Localised') or e.get('Victim'))
+            cmb_kill(s, t, 'civil', nom, live_texte(e.get('Faction')), 0, 'M')
+            cmb_journal(s, t, 'x', (nom or 'Civil') + ' tué')
     elif ev == 'ApproachSettlement':
         g['lieu'] = live_texte(e.get('Name'))
         g['lieu_sys'] = live_etat['systeme']
