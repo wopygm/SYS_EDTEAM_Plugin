@@ -22,7 +22,7 @@ except ImportError:
     config = None
 
 plugin_name = "SYS.EDTEAM"
-PLUGIN_VERSION = "2.47"
+PLUGIN_VERSION = "2.48"
 
 SUPABASE_URL = "https://oailvdigfdoyfcydmabb.supabase.co"
 SUPABASE_KEY = "sb_publishable_AASqgRggHdIGttZHPGaWkA_VqrhuYNg"
@@ -4275,6 +4275,51 @@ def reperage_releve_systeme(entry):
     except Exception as e:
         logging.error(f"[SYS_EDTEAM] Erreur repérage : {e}")
 
+# =====================================================================================================
+# INSTALLATIONS A SCENARIO (v2.48) : le journal ne donne que le NOM d'une installation (FSSSignalDiscovered, SignalType « Installation »), jamais son proprietaire.
+# Le plugin envoie (adresse du systeme, noms) groupes par 4 secondes ; le serveur (installations_signaler, SQL 165) les croise avec les factions en Boom des directives de HAUSSE.
+# Un nom n'est envoye qu'une fois par session d'EDMC. Aucun affichage dans l'interface du plugin (rien a signaler au pilote).
+# =====================================================================================================
+installations_etat = {'absente': False, 'envoyees': set(), 'attente': {}, 'minuteur': None}
+installations_verrou = threading.Lock()
+
+def installations_noter(entry):
+    """Note une installation vue (evenement FSSSignalDiscovered) ; l'envoi part 4 secondes apres le dernier nom note."""
+    if installations_etat['absente']: return
+    nom = str(entry.get('SignalName') or '').strip()
+    adr = entry.get('SystemAddress')
+    systeme = str(systeme_actuel or '').strip()
+    if not nom or not isinstance(adr, int) or not systeme or systeme == "SYSTÈME INCONNU": return
+    if nom.startswith('$') or len(nom) > 100: return
+    with installations_verrou:
+        if (adr, nom) in installations_etat['envoyees']: return
+        lot = installations_etat['attente'].setdefault(adr, {'s': systeme, 'n': set()})
+        lot['n'].add(nom)
+        if installations_etat['minuteur'] is None:
+            installations_etat['minuteur'] = threading.Timer(4.0, installations_envoyer)
+            installations_etat['minuteur'].daemon = True
+            installations_etat['minuteur'].start()
+
+def installations_envoyer():
+    with installations_verrou:
+        lots = installations_etat['attente']
+        installations_etat['attente'] = {}
+        installations_etat['minuteur'] = None
+    try:
+        if not lots or installations_etat['absente'] or not get_user_id(): return
+        for adr, lot in lots.items():
+            noms = sorted(lot['n'])[:30]
+            res = requests.post(f"{SUPABASE_URL}/rest/v1/rpc/installations_signaler", headers=get_headers(),
+                                json={'p': {'s': lot['s'], 'a': str(adr), 'n': noms}}, timeout=8)
+            if res.status_code == 404:
+                installations_etat['absente'] = True
+                return
+            if res.status_code in (200, 201, 204):
+                with installations_verrou:
+                    for nom in noms: installations_etat['envoyees'].add((adr, nom))
+    except Exception as e:
+        logging.error(f"[SYS_EDTEAM] Erreur installations : {e}")
+
 def sync_conflits_supabase(systeme, conflits):
     try:
         h = get_headers()
@@ -4405,6 +4450,11 @@ def journal_entry(cmdr, is_beta, system, station, entry, state):
     # Colonisation : releve des chantiers, livraisons et systemes (aucun appel reseau ici)
     try: col_traiter_evenement(entry)
     except Exception as e: col_trace('evenement ignore : %r' % (e,))
+
+    # Installations a scenario vues (nom seulement, groupees avant l'envoi : v2.48)
+    if event == 'FSSSignalDiscovered' and entry.get('SignalType') == 'Installation':
+        try: installations_noter(entry)
+        except Exception as e: logging.error(f"[SYS_EDTEAM] Installation ignoree : {e}")
 
     # Powerplay par systeme : etat des systemes et merites rattaches au systeme (aucun appel reseau ici)
     try: ppm_traiter_evenement(entry, ppm_live)
