@@ -22,7 +22,7 @@ except ImportError:
     config = None
 
 plugin_name = "SYS.EDTEAM"
-PLUGIN_VERSION = "2.48"
+PLUGIN_VERSION = "2.49"
 
 SUPABASE_URL = "https://oailvdigfdoyfcydmabb.supabase.co"
 SUPABASE_KEY = "sb_publishable_AASqgRggHdIGttZHPGaWkA_VqrhuYNg"
@@ -4276,20 +4276,27 @@ def reperage_releve_systeme(entry):
         logging.error(f"[SYS_EDTEAM] Erreur repérage : {e}")
 
 # =====================================================================================================
-# INSTALLATIONS A SCENARIO (v2.48) : le journal ne donne que le NOM d'une installation (FSSSignalDiscovered, SignalType « Installation »), jamais son proprietaire.
+# INSTALLATIONS A SCENARIO (v2.49) : le journal ne donne que le NOM d'une installation (FSSSignalDiscovered, SignalType « Installation »), jamais son proprietaire.
 # Le plugin envoie (adresse du systeme, noms) groupes par 4 secondes ; le serveur (installations_signaler, SQL 165) les croise avec les factions en Boom des directives de HAUSSE.
 # Un nom n'est envoye qu'une fois par session d'EDMC. Aucun affichage dans l'interface du plugin (rien a signaler au pilote).
 # =====================================================================================================
-installations_etat = {'absente': False, 'envoyees': set(), 'attente': {}, 'minuteur': None}
+installations_etat = {'absente': False, 'envoyees': set(), 'attente': {}, 'minuteur': None, 'noms': {}}
 installations_verrou = threading.Lock()
+
+def installations_retenir_systeme(entry):
+    """Retient le nom du systeme par son adresse (saut, localisation) : le systeme courant d'EDMC peut retarder sur les signaux."""
+    adr, nom = entry.get('SystemAddress'), str(entry.get('StarSystem') or '').strip()
+    if isinstance(adr, int) and nom:
+        if len(installations_etat['noms']) > 500: installations_etat['noms'].clear()
+        installations_etat['noms'][adr] = nom
 
 def installations_noter(entry):
     """Note une installation vue (evenement FSSSignalDiscovered) ; l'envoi part 4 secondes apres le dernier nom note."""
     if installations_etat['absente']: return
     nom = str(entry.get('SignalName') or '').strip()
     adr = entry.get('SystemAddress')
-    systeme = str(systeme_actuel or '').strip()
-    if not nom or not isinstance(adr, int) or not systeme or systeme == "SYSTÈME INCONNU": return
+    systeme = installations_etat['noms'].get(adr) if isinstance(adr, int) else None
+    if not nom or not systeme: return
     if nom.startswith('$') or len(nom) > 100: return
     with installations_verrou:
         if (adr, nom) in installations_etat['envoyees']: return
@@ -4451,7 +4458,8 @@ def journal_entry(cmdr, is_beta, system, station, entry, state):
     try: col_traiter_evenement(entry)
     except Exception as e: col_trace('evenement ignore : %r' % (e,))
 
-    # Installations a scenario vues (nom seulement, groupees avant l'envoi : v2.48)
+    # Installations a scenario vues (nom seulement, groupees avant l'envoi : v2.49)
+    if event in ('FSDJump', 'Location', 'CarrierJump'): installations_retenir_systeme(entry)
     if event == 'FSSSignalDiscovered' and entry.get('SignalType') == 'Installation':
         try: installations_noter(entry)
         except Exception as e: logging.error(f"[SYS_EDTEAM] Installation ignoree : {e}")
