@@ -22,7 +22,7 @@ except ImportError:
     config = None
 
 plugin_name = "SYS.EDTEAM"
-PLUGIN_VERSION = "2.51"
+PLUGIN_VERSION = "2.52"
 
 SUPABASE_URL = "https://oailvdigfdoyfcydmabb.supabase.co"
 SUPABASE_KEY = "sb_publishable_AASqgRggHdIGttZHPGaWkA_VqrhuYNg"
@@ -3445,6 +3445,248 @@ def hg_envoyer(force=False):
         g['echecs'] += 1
 
 
+# ============================================================================
+# FLEET CARRIER PERSONNEL (SQL 185) : position du carrier du pilote, pour la page « Mon hangar » et la liste des carriers de l'escadron.
+# Sources du journal : CarrierStats (indicatif, nom, acces aux docks), CarrierLocation (systeme, a chaque ouverture de session), CarrierJumpRequest / CarrierJumpCancelled (saut annonce),
+# CarrierJump / Docked / Location sur son propre carrier (position confirmee), CarrierBuy. Seul le carrier PERSONNEL (FleetCarrier) est gardé : ni solde, ni cargaison, ni carburant.
+# Rien n'est envoye tant que rien n'a change ; l'envoi est groupe (une fois par minute au plus), le serveur remplace la ligne du pilote. Un pilote sans carrier n'envoie jamais rien.
+# ============================================================================
+FC_FICHIER = 'fc_etat.json'
+FC_RELECTURE = '2.52'            # a changer pour obliger tous les plugins a relire une fois tous leurs journaux
+FC_DELAI = 60                    # secondes entre deux envois
+FC_EVENEMENTS = ('CarrierStats', 'CarrierLocation', 'CarrierJumpRequest', 'CarrierJumpCancelled', 'CarrierJump', 'CarrierBuy', 'Docked', 'Location')
+fc_re_journal = re.compile('"event":"(CarrierStats|CarrierLocation|CarrierJumpRequest|CarrierJumpCancelled|CarrierJump|CarrierBuy|Docked|Location)"')
+fc_verrou = threading.RLock()
+fc_etat = {'c': {}, 'marqueur': ''}      # c : {'id', 'cs' (indicatif), 'nom', 'acc' (acces aux docks), 'sys', 'dest', 'dep' (epoch du depart), 'vu' (epoch de la derniere information)}
+fc_flags = {'pret': False, 'sale': False, 'absente': False, 'dernier': 0.0, 'echecs': 0, 'empreinte': ''}
+fc_file = []                     # evenements vus en direct pendant la relecture des journaux
+
+
+def fc_chemin():
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), FC_FICHIER)
+
+
+def fc_trace(msg):
+    """Diagnostic : n'ecrit QUE si un fichier fc_debug.txt existe deja a cote de load.py (le creer vide pour activer)."""
+    try:
+        chemin = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'fc_debug.txt')
+        if not os.path.exists(chemin):
+            return
+        with open(chemin, 'a', encoding='utf-8') as f:
+            f.write(datetime.now().strftime('%H:%M:%S') + ' ' + str(msg) + chr(10))
+    except Exception:
+        pass
+
+
+def fc_charger_etat():
+    try:
+        with open(fc_chemin(), 'r', encoding='utf-8') as f:
+            d = json.load(f)
+        with fc_verrou:
+            fc_etat['c'] = dict(d.get('c') or {})
+            fc_etat['marqueur'] = str(d.get('marqueur') or '')
+    except Exception:
+        pass
+
+
+def fc_sauver_etat():
+    """Ecriture atomique de l'etat (a cote de load.py) : evite de relire tous les journaux a chaque demarrage."""
+    try:
+        with fc_verrou:
+            donnees = json.dumps(fc_etat)
+        tmp = fc_chemin() + '.tmp'
+        with open(tmp, 'w', encoding='utf-8') as f:
+            f.write(donnees)
+        os.replace(tmp, fc_chemin())
+    except Exception as e:
+        fc_trace('sauvegarde impossible : %r' % (e,))
+
+
+def fc_epoch(ts):
+    try:
+        return int(datetime.strptime(str(ts)[:19], '%Y-%m-%dT%H:%M:%S').replace(tzinfo=timezone.utc).timestamp())
+    except Exception:
+        return 0
+
+
+def fc_entier(v):
+    try:
+        return int(v)
+    except Exception:
+        return 0
+
+
+def fc_appliquer(e):
+    """Un evenement du journal (sous fc_verrou). Les evenements arrivent dans l'ordre : le dernier fait foi."""
+    ev = e.get('event')
+    c = fc_etat['c']
+    t = fc_epoch(e.get('timestamp'))
+    sale = False
+    if ev == 'CarrierBuy':
+        cid = fc_entier(e.get('CarrierID'))
+        cs = str(e.get('Callsign') or '').strip().upper()[:7]
+        if cid and cs:
+            c.clear()
+            c.update({'id': cid, 'cs': cs, 'nom': '', 'acc': '', 'sys': live_texte(e.get('Location') or '')[:60], 'dest': '', 'dep': 0, 'vu': t})
+            sale = True
+    elif ev == 'CarrierStats':
+        if e.get('CarrierType') == 'FleetCarrier':
+            cid = fc_entier(e.get('CarrierID'))
+            cs = str(e.get('Callsign') or '').strip().upper()[:7]
+            if cid and cs:
+                if c.get('id') != cid:
+                    c.clear()
+                c.update({'id': cid, 'cs': cs, 'nom': str(e.get('Name') or '')[:40], 'acc': str(e.get('DockingAccess') or '')[:20]})
+                if not c.get('vu'):
+                    c['vu'] = t
+                sale = True
+    elif ev == 'CarrierLocation':
+        if e.get('CarrierType') == 'FleetCarrier':
+            cid = fc_entier(e.get('CarrierID'))
+            if cid:
+                if c.get('id') and c.get('id') != cid:
+                    c.clear()
+                c['id'] = cid
+                c['sys'] = live_texte(e.get('StarSystem') or '')[:60]
+                c['vu'] = t
+                if c.get('dep') and t >= c['dep']:
+                    c['dest'] = ''
+                    c['dep'] = 0
+                sale = True
+    elif ev == 'CarrierJumpRequest':
+        if e.get('CarrierType') == 'FleetCarrier':
+            cid = fc_entier(e.get('CarrierID'))
+            if cid and (not c.get('id') or c.get('id') == cid):
+                c['id'] = cid
+                c['dest'] = live_texte(e.get('SystemName') or '')[:60]
+                c['dep'] = fc_epoch(e.get('DepartureTime'))
+                c['vu'] = t
+                sale = True
+    elif ev == 'CarrierJumpCancelled':
+        cid = fc_entier(e.get('CarrierID'))
+        if cid and c.get('id') == cid:
+            c['dest'] = ''
+            c['dep'] = 0
+            c['vu'] = t
+            sale = True
+    elif ev in ('CarrierJump', 'Docked', 'Location'):
+        # position CONFIRMEE : seulement si le pilote est sur son propre carrier (meme identifiant de marche)
+        if c.get('id') and fc_entier(e.get('MarketID')) == c['id']:
+            c['sys'] = live_texte(e.get('StarSystem') or '')[:60]
+            c['vu'] = t
+            if ev == 'CarrierJump' or (c.get('dep') and t >= c['dep']):
+                c['dest'] = ''
+                c['dep'] = 0
+            sale = True
+    if sale:
+        fc_flags['sale'] = True
+
+
+def fc_traiter_evenement(e):
+    """Appelee pour chaque evenement en direct (aucun appel reseau). Pendant la relecture des journaux, les evenements attendent dans fc_file."""
+    ev = e.get('event')
+    if ev not in FC_EVENEMENTS:
+        return
+    if ev in ('Docked', 'Location') and e.get('StationType') != 'FleetCarrier':
+        return
+    with fc_verrou:
+        if not fc_flags['pret']:
+            fc_file.append(e)
+            return
+        fc_appliquer(e)
+
+
+def fc_scanner_journaux():
+    """Au demarrage : relit TOUS les journaux la premiere fois (ou quand FC_RELECTURE change), ensuite seulement ceux des 2 derniers jours."""
+    try:
+        fc_charger_etat()
+        complet = fc_etat.get('marqueur') != FC_RELECTURE
+        jdir = trouver_journal_dir()
+        if jdir and os.path.isdir(jdir):
+            limite = None if complet else time.time() - 2 * 86400
+            fichiers = sorted(f for f in os.listdir(jdir)
+                              if f.startswith('Journal.') and f.endswith('.log')
+                              and (limite is None or os.path.getmtime(os.path.join(jdir, f)) >= limite))
+            nb = 0
+            for nom_fichier in fichiers:
+                with open(os.path.join(jdir, nom_fichier), 'r', encoding='utf-8', errors='ignore') as f:
+                    for ligne in f:
+                        m = fc_re_journal.search(ligne)
+                        if not m:
+                            continue
+                        if m.group(1) in ('Docked', 'Location') and 'FleetCarrier' not in ligne:
+                            continue
+                        try:
+                            e = json.loads(ligne)
+                        except Exception:
+                            continue
+                        with fc_verrou:
+                            fc_appliquer(e)
+                        nb += 1
+            with fc_verrou:
+                fc_etat['marqueur'] = FC_RELECTURE
+            fc_trace('relecture %s : %d fichiers, %d evenements utiles, carrier %s' % ('complete' if complet else 'recente', len(fichiers), nb, fc_etat['c'].get('cs', 'aucun')))
+    except Exception as ex:
+        fc_trace('relecture : EXCEPTION %r' % (ex,))
+    finally:
+        with fc_verrou:
+            en_attente = list(fc_file)
+            del fc_file[:]
+            for e in en_attente:
+                try:
+                    fc_appliquer(e)
+                except Exception:
+                    pass
+            fc_flags['pret'] = True
+        fc_sauver_etat()          # meme sans carrier : le marqueur evite de relire tous les journaux a chaque demarrage
+
+
+def fc_instantane():
+    """L'objet a envoyer, ou None si le pilote n'a pas de carrier personnel connu."""
+    with fc_verrou:
+        c = fc_etat['c']
+        if not c.get('id') or not c.get('cs'):
+            return None
+        return {'id': c['id'], 'cs': c['cs'], 'nom': c.get('nom', ''), 'acc': c.get('acc', ''), 'sys': c.get('sys', ''),
+                'dest': c.get('dest', ''), 'dep': c.get('dep', 0), 'vu': c.get('vu', 0)}
+
+
+def fc_envoyer(force=False):
+    g = fc_flags
+    if g['absente'] or not g['pret'] or not g['sale'] or not live_flags['pret']:
+        return
+    maintenant = time.time()
+    if not force and maintenant - g['dernier'] < FC_DELAI * (1 + min(g['echecs'], 8)):
+        return
+    if not get_user_id():
+        return
+    obj = fc_instantane()
+    if not obj:
+        g['sale'] = False
+        return
+    empreinte = hashlib.md5(json.dumps(obj, sort_keys=True).encode('utf-8')).hexdigest()
+    if empreinte == g['empreinte']:
+        g['sale'] = False
+        return
+    g['dernier'] = maintenant
+    try:
+        res = requests.post(f"{SUPABASE_URL}/rest/v1/rpc/fc_releve", headers=get_headers(), json={'p_fc': obj}, timeout=15)
+        fc_trace('fc_releve : %s en %s -> HTTP %s %s' % (obj.get('cs'), obj.get('sys'), res.status_code, (res.text or '')[:120]))
+        if res.status_code in (200, 201, 204):
+            g['empreinte'] = empreinte
+            g['sale'] = False
+            g['echecs'] = 0
+            fc_sauver_etat()
+            return
+        if res.status_code == 404:
+            g['absente'] = True                                 # fonction pas encore creee en base : on ne reessaie pas
+            return
+        raise RuntimeError('HTTP ' + str(res.status_code))
+    except Exception as ex:
+        fc_trace('envoi en echec %r' % (ex,))
+        g['echecs'] += 1
+
+
 def cmb_nom(s):
     s = live_texte(s)
     m = re.search(r'#name=([^;]*);', s)
@@ -3999,6 +4241,10 @@ def live_boucle():
             hg_envoyer()
         except Exception as ex:
             live_trace('envoi hangar : %r' % (ex,))
+        try:
+            fc_envoyer()
+        except Exception as ex:
+            live_trace('envoi carrier : %r' % (ex,))
         # pendant les 2 s d'attente : surveillance de la charge du FSD (un petit fichier lu 4 fois par passe, seulement en jeu)
         jdir = trouver_journal_dir() if live_etat.get('en_ligne') else None
         for _ in range(4):
@@ -4101,6 +4347,7 @@ def plugin_start3(plugin_dir):
     threading.Thread(target=ppm_scanner_journaux, daemon=True).start()
     threading.Thread(target=bud_scanner_journaux, daemon=True).start()
     threading.Thread(target=hg_scanner_journaux, daemon=True).start()
+    threading.Thread(target=fc_scanner_journaux, daemon=True).start()
     threading.Thread(target=live_boucle, daemon=True).start()
     return "SYS.EDTEAM"
 
@@ -4125,6 +4372,10 @@ def plugin_stop():
     try: hg_envoyer(force=True)
     except: pass
     try: hg_sauver_etat()
+    except: pass
+    try: fc_envoyer(force=True)
+    except: pass
+    try: fc_sauver_etat()
     except: pass
     try:
         with live_verrou:
@@ -4496,6 +4747,10 @@ def journal_entry(cmdr, is_beta, system, station, entry, state):
     # Hangar : vaisseaux et equipement de chacun (aucun appel reseau ici)
     try: hg_traiter_evenement(entry)
     except Exception as e: hg_trace('evenement ignore : %r' % (e,))
+
+    # Fleet Carrier personnel : position et saut annonce (aucun appel reseau ici)
+    try: fc_traiter_evenement(entry)
+    except Exception as e: fc_trace('evenement ignore : %r' % (e,))
 
     # Suivi CZ
     if not hasattr(journal_entry, 'cz_cache'):
