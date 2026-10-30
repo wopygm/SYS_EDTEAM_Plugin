@@ -22,7 +22,7 @@ except ImportError:
     config = None
 
 plugin_name = "SYS.EDTEAM"
-PLUGIN_VERSION = "2.52"
+PLUGIN_VERSION = "2.53"
 
 SUPABASE_URL = "https://oailvdigfdoyfcydmabb.supabase.co"
 SUPABASE_KEY = "sb_publishable_AASqgRggHdIGttZHPGaWkA_VqrhuYNg"
@@ -3448,16 +3448,20 @@ def hg_envoyer(force=False):
 # ============================================================================
 # FLEET CARRIER PERSONNEL (SQL 185) : position du carrier du pilote, pour la page « Mon hangar » et la liste des carriers de l'escadron.
 # Sources du journal : CarrierStats (indicatif, nom, acces aux docks), CarrierLocation (systeme, a chaque ouverture de session), CarrierJumpRequest / CarrierJumpCancelled (saut annonce),
-# CarrierJump / Docked / Location sur son propre carrier (position confirmee), CarrierBuy. Seul le carrier PERSONNEL (FleetCarrier) est gardé : ni solde, ni cargaison, ni carburant.
+# CarrierJump / Docked / Location sur son propre carrier (position confirmee), CarrierBuy, et (2.53) les SERVICES du carrier : CarrierStats.Crew (etat de chaque service) + CarrierCrewServices (activation, pause).
+# Seul le carrier PERSONNEL (FleetCarrier) est gardé : ni solde, ni cargaison, ni carburant.
 # Rien n'est envoye tant que rien n'a change ; l'envoi est groupe (une fois par minute au plus), le serveur remplace la ligne du pilote. Un pilote sans carrier n'envoie jamais rien.
 # ============================================================================
 FC_FICHIER = 'fc_etat.json'
-FC_RELECTURE = '2.52'            # a changer pour obliger tous les plugins a relire une fois tous leurs journaux
+FC_RELECTURE = '2.53'            # a changer pour obliger tous les plugins a relire une fois tous leurs journaux
 FC_DELAI = 60                    # secondes entre deux envois
-FC_EVENEMENTS = ('CarrierStats', 'CarrierLocation', 'CarrierJumpRequest', 'CarrierJumpCancelled', 'CarrierJump', 'CarrierBuy', 'Docked', 'Location')
-fc_re_journal = re.compile('"event":"(CarrierStats|CarrierLocation|CarrierJumpRequest|CarrierJumpCancelled|CarrierJump|CarrierBuy|Docked|Location)"')
+FC_EVENEMENTS = ('CarrierStats', 'CarrierLocation', 'CarrierJumpRequest', 'CarrierJumpCancelled', 'CarrierJump', 'CarrierBuy', 'CarrierCrewServices', 'Docked', 'Location')
+# services du carrier (roles du jeu) : 0 = desactive, 1 = actif, 2 = en pause ; le Capitaine n'est pas un service
+FC_ROLES = ('Repair', 'Refuel', 'Rearm', 'Shipyard', 'Outfitting', 'CarrierFuel', 'Commodities', 'VoucherRedemption', 'Exploration', 'BlackMarket', 'VistaGenomics', 'PioneerSupplies', 'Bartender')
+FC_OPERATIONS = {'Activate': 1, 'Resume': 1, 'Deactivate': 0, 'Pause': 2}      # « Replace » (changement d'equipage) ne change pas l'etat du service
+fc_re_journal = re.compile('"event":"(CarrierStats|CarrierLocation|CarrierJumpRequest|CarrierJumpCancelled|CarrierJump|CarrierBuy|CarrierCrewServices|Docked|Location)"')
 fc_verrou = threading.RLock()
-fc_etat = {'c': {}, 'marqueur': ''}      # c : {'id', 'cs' (indicatif), 'nom', 'acc' (acces aux docks), 'sys', 'dest', 'dep' (epoch du depart), 'vu' (epoch de la derniere information)}
+fc_etat = {'c': {}, 'marqueur': ''}      # c : {'id', 'cs' (indicatif), 'nom', 'acc' (acces aux docks), 'sys', 'dest', 'dep' (epoch du depart), 'vu' (epoch de la derniere information), 'srv' (services : role -> 0 / 1 / 2)}
 fc_flags = {'pret': False, 'sale': False, 'absente': False, 'dernier': 0.0, 'echecs': 0, 'empreinte': ''}
 fc_file = []                     # evenements vus en direct pendant la relecture des journaux
 
@@ -3516,6 +3520,25 @@ def fc_entier(v):
         return 0
 
 
+def fc_services(crew):
+    """CarrierStats.Crew -> {role: 0 (desactive) | 1 (actif) | 2 (en pause)} pour les 13 services du jeu."""
+    srv = {}
+    for x in (crew or []):
+        try:
+            role = str(x.get('CrewRole') or '')
+            if role not in FC_ROLES:
+                continue
+            if not x.get('Activated'):
+                srv[role] = 0
+            elif x.get('Enabled') is False:
+                srv[role] = 2
+            else:
+                srv[role] = 1
+        except Exception:
+            continue
+    return srv
+
+
 def fc_appliquer(e):
     """Un evenement du journal (sous fc_verrou). Les evenements arrivent dans l'ordre : le dernier fait foi."""
     ev = e.get('event')
@@ -3537,6 +3560,9 @@ def fc_appliquer(e):
                 if c.get('id') != cid:
                     c.clear()
                 c.update({'id': cid, 'cs': cs, 'nom': str(e.get('Name') or '')[:40], 'acc': str(e.get('DockingAccess') or '')[:20]})
+                srv = fc_services(e.get('Crew'))
+                if srv:
+                    c['srv'] = srv
                 if not c.get('vu'):
                     c['vu'] = t
                 sale = True
@@ -3562,6 +3588,15 @@ def fc_appliquer(e):
                 c['dep'] = fc_epoch(e.get('DepartureTime'))
                 c['vu'] = t
                 sale = True
+    elif ev == 'CarrierCrewServices':
+        cid = fc_entier(e.get('CarrierID'))
+        role = str(e.get('CrewRole') or '')
+        nouveau = FC_OPERATIONS.get(str(e.get('Operation') or ''))
+        if cid and c.get('id') == cid and role in FC_ROLES and nouveau is not None:
+            if not isinstance(c.get('srv'), dict):
+                c['srv'] = {}
+            c['srv'][role] = nouveau
+            sale = True
     elif ev == 'CarrierJumpCancelled':
         cid = fc_entier(e.get('CarrierID'))
         if cid and c.get('id') == cid:
@@ -3647,8 +3682,11 @@ def fc_instantane():
         c = fc_etat['c']
         if not c.get('id') or not c.get('cs'):
             return None
-        return {'id': c['id'], 'cs': c['cs'], 'nom': c.get('nom', ''), 'acc': c.get('acc', ''), 'sys': c.get('sys', ''),
-                'dest': c.get('dest', ''), 'dep': c.get('dep', 0), 'vu': c.get('vu', 0)}
+        o = {'id': c['id'], 'cs': c['cs'], 'nom': c.get('nom', ''), 'acc': c.get('acc', ''), 'sys': c.get('sys', ''),
+             'dest': c.get('dest', ''), 'dep': c.get('dep', 0), 'vu': c.get('vu', 0)}
+        if isinstance(c.get('srv'), dict) and c['srv']:
+            o['srv'] = dict(c['srv'])
+        return o
 
 
 def fc_envoyer(force=False):
