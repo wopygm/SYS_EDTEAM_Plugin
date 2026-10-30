@@ -22,7 +22,7 @@ except ImportError:
     config = None
 
 plugin_name = "SYS.EDTEAM"
-PLUGIN_VERSION = "2.50"
+PLUGIN_VERSION = "2.51"
 
 SUPABASE_URL = "https://oailvdigfdoyfcydmabb.supabase.co"
 SUPABASE_KEY = "sb_publishable_AASqgRggHdIGttZHPGaWkA_VqrhuYNg"
@@ -4074,9 +4074,28 @@ def check_for_updates():
     except Exception as e:
         logging.error(f"SYS_EDTEAM : Erreur maj : {e}")
 
+def version_signaler():
+    """Dit a la base quelle version du plugin tourne chez ce pilote (une requete au demarrage, puis une toutes les 12 h : le serveur n'ecrit que si besoin)."""
+    time.sleep(25)
+    essais = 0
+    while True:
+        attente = 12 * 3600
+        try:
+            if lire_cle() and not invalid_api_key:
+                res = requests.post(f"{SUPABASE_URL}/rest/v1/rpc/plugin_signaler", headers=get_headers(), json={'p_version': str(PLUGIN_VERSION)}, timeout=10)
+                if res.status_code == 404:
+                    return                                  # fonction pas encore creee en base : on ne reessaie pas
+            else:
+                essais += 1
+                if essais < 20: attente = 120               # pas encore de cle : on reessaie un peu plus tard
+        except Exception:
+            attente = 600
+        time.sleep(attente)
+
 def plugin_start3(plugin_dir):
     threading.Thread(target=heartbeat_loop, daemon=True).start()
     threading.Thread(target=check_for_updates, daemon=True).start()
+    threading.Thread(target=version_signaler, daemon=True).start()
     threading.Thread(target=pp_scanner_journaux, daemon=True).start()
     threading.Thread(target=col_scanner_journaux, daemon=True).start()
     threading.Thread(target=ppm_scanner_journaux, daemon=True).start()
