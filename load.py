@@ -22,7 +22,7 @@ except ImportError:
     config = None
 
 plugin_name = "SYS.EDTEAM"
-PLUGIN_VERSION = "2.54"
+PLUGIN_VERSION = "2.55"
 
 SUPABASE_URL = "https://oailvdigfdoyfcydmabb.supabase.co"
 SUPABASE_KEY = "sb_publishable_AASqgRggHdIGttZHPGaWkA_VqrhuYNg"
@@ -3453,12 +3453,16 @@ def hg_envoyer(force=False):
 # Rien n'est envoye tant que rien n'a change ; l'envoi est groupe (une fois par minute au plus), le serveur remplace la ligne du pilote. Un pilote sans carrier n'envoie jamais rien.
 # ============================================================================
 FC_FICHIER = 'fc_etat.json'
-FC_RELECTURE = '2.54'            # a changer pour obliger tous les plugins a relire une fois tous leurs journaux
+FC_RELECTURE = '2.55'            # a changer pour obliger tous les plugins a relire une fois tous leurs journaux
 FC_DELAI = 60                    # secondes entre deux envois
 FC_EVENEMENTS = ('CarrierStats', 'CarrierLocation', 'CarrierJumpRequest', 'CarrierJumpCancelled', 'CarrierJump', 'CarrierBuy', 'CarrierCrewServices', 'Docked', 'Location')
 # services du carrier (roles du jeu) : 0 = desactive, 1 = actif, 2 = en pause ; le Capitaine n'est pas un service
 FC_ROLES = ('Repair', 'Refuel', 'Rearm', 'Shipyard', 'Outfitting', 'CarrierFuel', 'Commodities', 'VoucherRedemption', 'Exploration', 'BlackMarket', 'VistaGenomics', 'PioneerSupplies', 'Bartender')
 FC_OPERATIONS = {'Activate': 1, 'Resume': 1, 'Deactivate': 0, 'Pause': 2}      # « Replace » (changement d'equipage) ne change pas l'etat du service
+# SERVICES du carrier d'escadron (2.55) : depuis le jeu 4.4, CarrierStats.Crew est VIDE pour un membre. L'evenement Docked donne en revanche la liste des services ACTIFS de la station :
+# un service present = actif ; absent = desactive OU en pause (le jeu ne distingue pas). Verifie sur VULCAN (7 services actifs = ceux de CarrierStats) et sur ODYSSEUS (juin 2026).
+SC_SERVICES = {'repair': 'Repair', 'refuel': 'Refuel', 'rearm': 'Rearm', 'shipyard': 'Shipyard', 'outfitting': 'Outfitting', 'carrierfuel': 'CarrierFuel', 'commodities': 'Commodities',
+               'voucherredemption': 'VoucherRedemption', 'exploration': 'Exploration', 'blackmarket': 'BlackMarket', 'vistagenomics': 'VistaGenomics', 'pioneersupplies': 'PioneerSupplies', 'bartender': 'Bartender'}
 fc_re_journal = re.compile('"event":"(CarrierStats|CarrierLocation|CarrierJumpRequest|CarrierJumpCancelled|CarrierJump|CarrierBuy|CarrierCrewServices|Docked|Location)"')
 fc_verrou = threading.RLock()
 fc_etat = {'c': {}, 's': {}, 'marqueur': ''}      # c : {'id', 'cs' (indicatif), 'nom', 'acc' (acces aux docks), 'sys', 'dest', 'dep' (epoch du depart), 'vu' (epoch de la derniere information), 'srv' (services : role -> 0 / 1 / 2)}
@@ -3543,7 +3547,7 @@ def fc_services(crew):
 # --- CARRIER D'ESCADRON (plugin 2.54, SQL 189) : le carrier commun de l'escadron (CarrierType = SquadronCarrier), different du carrier personnel.
 # Tout membre le voit dans son journal (CarrierLocation a chaque ouverture de session, CarrierJumpRequest quand un saut est annonce, CarrierStats quand il ouvre la gestion du carrier).
 # On ne garde QUE : identifiant, indicatif de l'escadron, nom, acces aux docks, systeme, saut annonce. Jamais le solde, la cargaison, le carburant ni les taxes (presents dans CarrierStats).
-# Les services ne sont pas relevables (CarrierStats.Crew est vide pour un membre qui n'est pas le capitaine). Un seul membre suffit : le serveur garde la derniere information.
+# Les services (2.55) viennent de l'evenement Docked (StationServices), car CarrierStats.Crew est vide depuis le jeu 4.4. Un seul membre suffit : le serveur garde la derniere information.
 sc_flags = {'sale': False, 'absente': False, 'dernier': 0.0, 'echecs': 0, 'empreinte': ''}
 
 
@@ -3564,6 +3568,10 @@ def sc_appliquer(e):
                 sq['cs'] = cs
             sq['nom'] = str(e.get('Name') or '')[:40]
             sq['acc'] = str(e.get('DockingAccess') or '')[:20]
+            srv = fc_services(e.get('Crew'))
+            if srv:                                  # liste d'equipage remplie (jeu avant 4.4) : une liste VIDE n'efface jamais les services connus
+                sq['srv'] = srv
+                sq['srv_t'] = t
             if not sq.get('vu'):
                 sq['vu'] = t
             sale = True
@@ -3592,12 +3600,17 @@ def sc_appliquer(e):
         sq['dep'] = 0
         sq['vu'] = t
         sale = True
-    elif ev in ('CarrierJump', 'Docked', 'Location') and e.get('StationType') == 'SquadronCarrier' and sq.get('id') and fc_entier(e.get('MarketID')) == sq['id']:
+    elif ev in ('CarrierJump', 'Docked', 'Location') and e.get('StationType') in ('FleetCarrier', 'SquadronCarrier') and sq.get('id') and fc_entier(e.get('MarketID')) == sq['id']:
+        # position CONFIRMEE (le jeu ecrit « FleetCarrier » meme pour le carrier d'escadron : on reconnait le sien a son identifiant de marche)
         sq['sys'] = live_texte(e.get('StarSystem') or '')[:60]
         sq['vu'] = t
         if ev == 'CarrierJump' or (sq.get('dep') and t >= sq['dep']):
             sq['dest'] = ''
             sq['dep'] = 0
+        if ev == 'Docked' and isinstance(e.get('StationServices'), list):
+            actifs = set(str(x).lower() for x in e['StationServices'])
+            sq['srv'] = {role: (1 if cle in actifs else 0) for cle, role in SC_SERVICES.items()}
+            sq['srv_t'] = t
         sale = True
     else:
         return False
@@ -3612,8 +3625,12 @@ def sc_instantane():
         sq = fc_etat['s']
         if not sq.get('id') or not sq.get('sys'):
             return None
-        return {'id': sq['id'], 'cs': sq.get('cs', ''), 'nom': sq.get('nom', ''), 'acc': sq.get('acc', ''), 'sys': sq.get('sys', ''),
-                'dest': sq.get('dest', ''), 'dep': sq.get('dep', 0), 'vu': sq.get('vu', 0)}
+        o = {'id': sq['id'], 'cs': sq.get('cs', ''), 'nom': sq.get('nom', ''), 'acc': sq.get('acc', ''), 'sys': sq.get('sys', ''),
+             'dest': sq.get('dest', ''), 'dep': sq.get('dep', 0), 'vu': sq.get('vu', 0)}
+        if isinstance(sq.get('srv'), dict) and sq['srv']:
+            o['srv'] = dict(sq['srv'])
+            o['srv_t'] = sq.get('srv_t', 0)
+        return o
 
 
 def sc_envoyer(force=False):
