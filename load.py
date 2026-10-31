@@ -22,7 +22,7 @@ except ImportError:
     config = None
 
 plugin_name = "SYS.EDTEAM"
-PLUGIN_VERSION = "2.56"
+PLUGIN_VERSION = "2.57"
 
 SUPABASE_URL = "https://oailvdigfdoyfcydmabb.supabase.co"
 SUPABASE_KEY = "sb_publishable_AASqgRggHdIGttZHPGaWkA_VqrhuYNg"
@@ -515,6 +515,15 @@ def ppm_etat_depuis(e):
     if ('PowerplayState' not in e) and ('Powers' not in e) and ('ControllingPower' not in e):
         return None
     powers = e.get('Powers')
+    # progression de CHAQUE puissance en lice (systeme inoccupe ou en conquete : v2.57), fraction de 0 a 1 telle que le journal l'ecrit
+    conflit = []
+    for c in (e.get('PowerplayConflictProgress') or [])[:14]:
+        try:
+            if isinstance(c, dict) and c.get('Power') and c.get('ConflictProgress') is not None:
+                v = float(c.get('ConflictProgress'))
+                if 0 <= v <= 1: conflit.append({'p': str(c.get('Power'))[:80], 'v': round(v, 6)})
+        except Exception:
+            pass
     return {
         'controlling': e.get('ControllingPower') or None,
         'powers': [str(p) for p in powers] if isinstance(powers, list) else [],
@@ -522,6 +531,7 @@ def ppm_etat_depuis(e):
         'progres': e.get('PowerplayStateControlProgress'),
         'renf': e.get('PowerplayStateReinforcement'),
         'sape': e.get('PowerplayStateUndermining'),
+        'conflit': conflit,
     }
 
 def ppm_traiter_evenement(e, st, depuis=0.0):
@@ -544,13 +554,13 @@ def ppm_traiter_evenement(e, st, depuis=0.0):
         t = ppm_epoch(ts)
         if t is None or t < depuis:
             return
-        signature = (etat['controlling'], etat['etat'], etat['progres'], etat['renf'], etat['sape'])
+        signature = (etat['controlling'], etat['etat'], etat['progres'], etat['renf'], etat['sape'], tuple((c['p'], c['v']) for c in etat['conflit']))
         with ppm_verrou:
             if ppm_vu.get(adr) == signature or len(ppm_attente['obs']) >= PPM_MAX_ATTENTE:
                 return
             ppm_vu[adr] = signature
             ppm_attente['obs'].append({'adresse': int(adr), 'nom': str(nom), 'ts': ts, 'controlling': etat['controlling'], 'powers': etat['powers'],
-                                       'etat': etat['etat'], 'progres': etat['progres'], 'renf': etat['renf'], 'sape': etat['sape']})
+                                       'etat': etat['etat'], 'progres': etat['progres'], 'renf': etat['renf'], 'sape': etat['sape'], 'conflit': etat['conflit']})
             if ts and str(ts) > ppm_flags['dernier_ts']:
                 ppm_flags['dernier_ts'] = str(ts)
         return
