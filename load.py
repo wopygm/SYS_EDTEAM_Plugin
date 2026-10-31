@@ -3448,7 +3448,7 @@ def hg_envoyer(force=False):
 # ============================================================================
 # FLEET CARRIER PERSONNEL (SQL 185) : position du carrier du pilote, pour la page « Mon hangar » et la liste des carriers de l'escadron.
 # Sources du journal : CarrierStats (indicatif, nom, acces aux docks), CarrierLocation (systeme, a chaque ouverture de session), CarrierJumpRequest / CarrierJumpCancelled (saut annonce),
-# CarrierJump / Docked / Location sur son propre carrier (position confirmee), CarrierBuy, et (2.53) les SERVICES du carrier : CarrierStats.Crew (etat de chaque service) + CarrierCrewServices (activation, pause).
+# CarrierJump / Docked / Location sur son propre carrier (position confirmee), CarrierBuy (indicatif et VARIANTE du carrier), et (2.53) les SERVICES du carrier : CarrierStats.Crew (etat de chaque service) + CarrierCrewServices (activation, pause).
 # Seul le carrier PERSONNEL (FleetCarrier) est gardé : ni solde, ni cargaison, ni carburant.
 # Rien n'est envoye tant que rien n'a change ; l'envoi est groupe (une fois par minute au plus), le serveur remplace la ligne du pilote. Un pilote sans carrier n'envoie jamais rien.
 # ============================================================================
@@ -3551,6 +3551,9 @@ def fc_appliquer(e):
         if cid and cs:
             c.clear()
             c.update({'id': cid, 'cs': cs, 'nom': '', 'acc': '', 'sys': live_texte(e.get('Location') or '')[:60], 'dest': '', 'dep': 0, 'vu': t})
+            var = str(e.get('Variant') or '')
+            if re.match(r'^CarrierDock[A-C]$', var):
+                c['var'] = var                       # type de carrier (3 modeles) : donne l'hologramme affiche sur le site
             sale = True
     elif ev == 'CarrierStats':
         if e.get('CarrierType') == 'FleetCarrier':
@@ -3686,6 +3689,8 @@ def fc_instantane():
              'dest': c.get('dest', ''), 'dep': c.get('dep', 0), 'vu': c.get('vu', 0)}
         if isinstance(c.get('srv'), dict) and c['srv']:
             o['srv'] = dict(c['srv'])
+        if c.get('var'):
+            o['var'] = c['var']
         return o
 
 
