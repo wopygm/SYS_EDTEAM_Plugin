@@ -22,7 +22,7 @@ except ImportError:
     config = None
 
 plugin_name = "SYS.EDTEAM"
-PLUGIN_VERSION = "2.55"
+PLUGIN_VERSION = "2.56"
 
 SUPABASE_URL = "https://oailvdigfdoyfcydmabb.supabase.co"
 SUPABASE_KEY = "sb_publishable_AASqgRggHdIGttZHPGaWkA_VqrhuYNg"
@@ -4591,17 +4591,38 @@ def plugin_prefs(parent, cmdr, is_beta):
 bgs_releve_etat = {'absente': False, 'derniers': {}, 'ordres': [], 'ordres_ts': 0.0}
 
 def bgs_ordres_cibles():
-    """Systemes des directives actives (liste mise en memoire 5 minutes). Vide si la lecture echoue."""
+    """Systemes des directives actives ET des systemes SURVEILLES par l'etat-major de l'escadron (v2.56) : liste mise en memoire 5 minutes. Vide si la lecture echoue."""
     try:
         maintenant = time.time()
         if maintenant - bgs_releve_etat['ordres_ts'] > 300:
             res = requests.get(f"{SUPABASE_URL}/rest/v1/ordres_bgs?statut=eq.ACTIF&select=systeme_cible", headers=get_headers(), timeout=5)
             if res.status_code == 200:
-                bgs_releve_etat['ordres'] = [str(o.get('systeme_cible') or '').strip().lower() for o in res.json() if o.get('systeme_cible')]
+                noms = [str(o.get('systeme_cible') or '').strip().lower() for o in res.json() if o.get('systeme_cible')]
+                if not bgs_releve_etat.get('surv_absente'):                 # fonction serveur surveillance_cibles (SQL 193) : absente = on ne reessaie pas
+                    try:
+                        r2 = requests.post(f"{SUPABASE_URL}/rest/v1/rpc/surveillance_cibles", headers=get_headers(), json={}, timeout=5)
+                        if r2.status_code == 404:
+                            bgs_releve_etat['surv_absente'] = True
+                        elif r2.status_code == 200:
+                            noms += [str(x).strip().lower() for x in (r2.json() or []) if x]
+                    except Exception:
+                        pass
+                bgs_releve_etat['ordres'] = noms
                 bgs_releve_etat['ordres_ts'] = maintenant
         return bgs_releve_etat['ordres']
     except Exception:
         return bgs_releve_etat['ordres']
+
+def releves_systeme_ordonnes(entry):
+    """v2.56 : mission de reperage PUIS releve des factions, dans CET ordre et dans une seule tache : si les factions etaient envoyees d'abord, le systeme paraitrait deja « a jour » et le point du reperage ne serait pas compte."""
+    try:
+        reperage_releve_systeme(entry)
+    except Exception:
+        pass
+    try:
+        bgs_releve_systeme(entry)
+    except Exception:
+        pass
 
 def bgs_noms_etats(liste):
     """['Expansion', 'War'] a partir de [{'State': 'Expansion'}, ...] (journal du jeu)."""
@@ -4999,10 +5020,8 @@ def journal_entry(cmdr, is_beta, system, station, entry, state):
             sys_nom = entry.get('StarSystem') or systeme_actuel
             if conflits and sys_nom:
                 threading.Thread(target=sync_conflits_supabase, args=(sys_nom, conflits), daemon=True).start()
-            # releve des factions du systeme, seulement s'il est cible d'une directive active (v2.42)
-            threading.Thread(target=bgs_releve_systeme, args=(entry,), daemon=True).start()
-            # mission de reperage de l'escadron : coordonnees, nombre de factions, progression de conquete (v2.43)
-            threading.Thread(target=reperage_releve_systeme, args=(entry,), daemon=True).start()
+            # mission de reperage de l'escadron (coordonnees, nombre de factions, conquetes : v2.43) PUIS releve des factions du systeme, s'il est cible d'une directive active (v2.42) ou surveille (v2.56)
+            threading.Thread(target=releves_systeme_ordonnes, args=(entry,), daemon=True).start()
 
     elif event == 'LoadGame':
         ship_name = entry.get('ShipName', 'VAISSEAU TACTIQUE')
