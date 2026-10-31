@@ -22,7 +22,7 @@ except ImportError:
     config = None
 
 plugin_name = "SYS.EDTEAM"
-PLUGIN_VERSION = "2.53"
+PLUGIN_VERSION = "2.54"
 
 SUPABASE_URL = "https://oailvdigfdoyfcydmabb.supabase.co"
 SUPABASE_KEY = "sb_publishable_AASqgRggHdIGttZHPGaWkA_VqrhuYNg"
@@ -3453,7 +3453,7 @@ def hg_envoyer(force=False):
 # Rien n'est envoye tant que rien n'a change ; l'envoi est groupe (une fois par minute au plus), le serveur remplace la ligne du pilote. Un pilote sans carrier n'envoie jamais rien.
 # ============================================================================
 FC_FICHIER = 'fc_etat.json'
-FC_RELECTURE = '2.53'            # a changer pour obliger tous les plugins a relire une fois tous leurs journaux
+FC_RELECTURE = '2.54'            # a changer pour obliger tous les plugins a relire une fois tous leurs journaux
 FC_DELAI = 60                    # secondes entre deux envois
 FC_EVENEMENTS = ('CarrierStats', 'CarrierLocation', 'CarrierJumpRequest', 'CarrierJumpCancelled', 'CarrierJump', 'CarrierBuy', 'CarrierCrewServices', 'Docked', 'Location')
 # services du carrier (roles du jeu) : 0 = desactive, 1 = actif, 2 = en pause ; le Capitaine n'est pas un service
@@ -3461,7 +3461,7 @@ FC_ROLES = ('Repair', 'Refuel', 'Rearm', 'Shipyard', 'Outfitting', 'CarrierFuel'
 FC_OPERATIONS = {'Activate': 1, 'Resume': 1, 'Deactivate': 0, 'Pause': 2}      # « Replace » (changement d'equipage) ne change pas l'etat du service
 fc_re_journal = re.compile('"event":"(CarrierStats|CarrierLocation|CarrierJumpRequest|CarrierJumpCancelled|CarrierJump|CarrierBuy|CarrierCrewServices|Docked|Location)"')
 fc_verrou = threading.RLock()
-fc_etat = {'c': {}, 'marqueur': ''}      # c : {'id', 'cs' (indicatif), 'nom', 'acc' (acces aux docks), 'sys', 'dest', 'dep' (epoch du depart), 'vu' (epoch de la derniere information), 'srv' (services : role -> 0 / 1 / 2)}
+fc_etat = {'c': {}, 's': {}, 'marqueur': ''}      # c : {'id', 'cs' (indicatif), 'nom', 'acc' (acces aux docks), 'sys', 'dest', 'dep' (epoch du depart), 'vu' (epoch de la derniere information), 'srv' (services : role -> 0 / 1 / 2)}
 fc_flags = {'pret': False, 'sale': False, 'absente': False, 'dernier': 0.0, 'echecs': 0, 'empreinte': ''}
 fc_file = []                     # evenements vus en direct pendant la relecture des journaux
 
@@ -3488,6 +3488,7 @@ def fc_charger_etat():
             d = json.load(f)
         with fc_verrou:
             fc_etat['c'] = dict(d.get('c') or {})
+            fc_etat['s'] = dict(d.get('s') or {})
             fc_etat['marqueur'] = str(d.get('marqueur') or '')
     except Exception:
         pass
@@ -3539,8 +3540,122 @@ def fc_services(crew):
     return srv
 
 
+# --- CARRIER D'ESCADRON (plugin 2.54, SQL 189) : le carrier commun de l'escadron (CarrierType = SquadronCarrier), different du carrier personnel.
+# Tout membre le voit dans son journal (CarrierLocation a chaque ouverture de session, CarrierJumpRequest quand un saut est annonce, CarrierStats quand il ouvre la gestion du carrier).
+# On ne garde QUE : identifiant, indicatif de l'escadron, nom, acces aux docks, systeme, saut annonce. Jamais le solde, la cargaison, le carburant ni les taxes (presents dans CarrierStats).
+# Les services ne sont pas relevables (CarrierStats.Crew est vide pour un membre qui n'est pas le capitaine). Un seul membre suffit : le serveur garde la derniere information.
+sc_flags = {'sale': False, 'absente': False, 'dernier': 0.0, 'echecs': 0, 'empreinte': ''}
+
+
+def sc_appliquer(e):
+    """Un evenement du journal concernant le carrier d'escadron (sous fc_verrou). Renvoie True si l'evenement le concerne (il n'est alors PAS applique au carrier personnel)."""
+    ev = e.get('event')
+    sq = fc_etat['s']
+    t = fc_epoch(e.get('timestamp'))
+    cid = fc_entier(e.get('CarrierID'))
+    sale = False
+    if e.get('CarrierType') == 'SquadronCarrier' and cid:
+        if sq.get('id') and sq.get('id') != cid:
+            sq.clear()
+        sq['id'] = cid
+        if ev == 'CarrierStats':
+            cs = str(e.get('Callsign') or '').strip().upper()[:7]
+            if cs:
+                sq['cs'] = cs
+            sq['nom'] = str(e.get('Name') or '')[:40]
+            sq['acc'] = str(e.get('DockingAccess') or '')[:20]
+            if not sq.get('vu'):
+                sq['vu'] = t
+            sale = True
+        elif ev == 'CarrierLocation':
+            sq['sys'] = live_texte(e.get('StarSystem') or '')[:60]
+            sq['vu'] = t
+            if sq.get('dep') and t >= sq['dep']:
+                sq['dest'] = ''
+                sq['dep'] = 0
+            sale = True
+        elif ev == 'CarrierJumpRequest':
+            sq['dest'] = live_texte(e.get('SystemName') or '')[:60]
+            sq['dep'] = fc_epoch(e.get('DepartureTime'))
+            sq['vu'] = t
+            sale = True
+        elif ev == 'CarrierJump':
+            sq['sys'] = live_texte(e.get('StarSystem') or '')[:60]
+            sq['dest'] = ''
+            sq['dep'] = 0
+            sq['vu'] = t
+            sale = True
+        else:
+            return True
+    elif ev == 'CarrierJumpCancelled' and cid and sq.get('id') == cid and fc_etat['c'].get('id') != cid:
+        sq['dest'] = ''
+        sq['dep'] = 0
+        sq['vu'] = t
+        sale = True
+    elif ev in ('CarrierJump', 'Docked', 'Location') and e.get('StationType') == 'SquadronCarrier' and sq.get('id') and fc_entier(e.get('MarketID')) == sq['id']:
+        sq['sys'] = live_texte(e.get('StarSystem') or '')[:60]
+        sq['vu'] = t
+        if ev == 'CarrierJump' or (sq.get('dep') and t >= sq['dep']):
+            sq['dest'] = ''
+            sq['dep'] = 0
+        sale = True
+    else:
+        return False
+    if sale:
+        sc_flags['sale'] = True
+    return True
+
+
+def sc_instantane():
+    """L'objet a envoyer, ou None si le carrier d'escadron n'est pas connu (identifiant et systeme au minimum)."""
+    with fc_verrou:
+        sq = fc_etat['s']
+        if not sq.get('id') or not sq.get('sys'):
+            return None
+        return {'id': sq['id'], 'cs': sq.get('cs', ''), 'nom': sq.get('nom', ''), 'acc': sq.get('acc', ''), 'sys': sq.get('sys', ''),
+                'dest': sq.get('dest', ''), 'dep': sq.get('dep', 0), 'vu': sq.get('vu', 0)}
+
+
+def sc_envoyer(force=False):
+    g = sc_flags
+    if g['absente'] or not fc_flags['pret'] or not g['sale'] or not live_flags['pret']:
+        return
+    maintenant = time.time()
+    if not force and maintenant - g['dernier'] < FC_DELAI * (1 + min(g['echecs'], 8)):
+        return
+    if not get_user_id():
+        return
+    obj = sc_instantane()
+    if not obj:
+        g['sale'] = False
+        return
+    empreinte = hashlib.md5(json.dumps(obj, sort_keys=True).encode('utf-8')).hexdigest()
+    if empreinte == g['empreinte']:
+        g['sale'] = False
+        return
+    g['dernier'] = maintenant
+    try:
+        res = requests.post(f"{SUPABASE_URL}/rest/v1/rpc/fc_sc_releve", headers=get_headers(), json={'p_sc': obj}, timeout=15)
+        fc_trace('fc_sc_releve : %s en %s -> HTTP %s %s' % (obj.get('cs'), obj.get('sys'), res.status_code, (res.text or '')[:120]))
+        if res.status_code in (200, 201, 204):
+            g['empreinte'] = empreinte
+            g['sale'] = False
+            g['echecs'] = 0
+            fc_sauver_etat()
+            return
+        if res.status_code == 404:
+            g['absente'] = True                                 # fonction pas encore creee en base : on ne reessaie pas
+            return
+        raise RuntimeError('HTTP ' + str(res.status_code))
+    except Exception as ex:
+        fc_trace('envoi carrier d escadron en echec %r' % (ex,))
+        g['echecs'] += 1
+
+
 def fc_appliquer(e):
     """Un evenement du journal (sous fc_verrou). Les evenements arrivent dans l'ordre : le dernier fait foi."""
+    if sc_appliquer(e):
+        return                  # evenement du carrier d'escadron : ne touche jamais au carrier personnel
     ev = e.get('event')
     c = fc_etat['c']
     t = fc_epoch(e.get('timestamp'))
@@ -3625,7 +3740,7 @@ def fc_traiter_evenement(e):
     ev = e.get('event')
     if ev not in FC_EVENEMENTS:
         return
-    if ev in ('Docked', 'Location') and e.get('StationType') != 'FleetCarrier':
+    if ev in ('Docked', 'Location') and e.get('StationType') not in ('FleetCarrier', 'SquadronCarrier'):
         return
     with fc_verrou:
         if not fc_flags['pret']:
@@ -3652,7 +3767,7 @@ def fc_scanner_journaux():
                         m = fc_re_journal.search(ligne)
                         if not m:
                             continue
-                        if m.group(1) in ('Docked', 'Location') and 'FleetCarrier' not in ligne:
+                        if m.group(1) in ('Docked', 'Location') and 'FleetCarrier' not in ligne and 'SquadronCarrier' not in ligne:
                             continue
                         try:
                             e = json.loads(ligne)
@@ -4288,6 +4403,10 @@ def live_boucle():
             fc_envoyer()
         except Exception as ex:
             live_trace('envoi carrier : %r' % (ex,))
+        try:
+            sc_envoyer()
+        except Exception as ex:
+            live_trace('envoi carrier d escadron : %r' % (ex,))
         # pendant les 2 s d'attente : surveillance de la charge du FSD (un petit fichier lu 4 fois par passe, seulement en jeu)
         jdir = trouver_journal_dir() if live_etat.get('en_ligne') else None
         for _ in range(4):
@@ -4417,6 +4536,8 @@ def plugin_stop():
     try: hg_sauver_etat()
     except: pass
     try: fc_envoyer(force=True)
+    except: pass
+    try: sc_envoyer(force=True)
     except: pass
     try: fc_sauver_etat()
     except: pass
